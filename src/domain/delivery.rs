@@ -83,7 +83,7 @@ mod tests {
 
     #[test]
     fn queue_trailing_period_needs_separator() {
-        // Same as kimaki: `queue.` still needs punctuation/newline before it.
+        // `queue.` still needs punctuation/newline before it.
         assert_eq!(parse("review this queue."), (Delivery::Normal, "review this queue.".into()));
         assert_eq!(parse("review this. queue."), (Delivery::Queue, "review this".into()));
     }

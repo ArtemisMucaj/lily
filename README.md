@@ -1,24 +1,31 @@
 # lily
 
-A collaborative agent orchestrator inside Discord, written in Rust. lily is a
-clone of [kimaki](https://github.com/remorses/kimaki)'s core: it connects
-Discord to a local [OpenCode](https://opencode.ai) server so you can drive
-coding agents from chat.
+A collaborative agent orchestrator inside your chat, written in Rust. lily
+connects Discord and Matrix to a local [OpenCode](https://opencode.ai) server
+so you can drive coding agents from a conversation.
 
-- **Channels are projects.** Each channel is linked to a project directory on
-  the machine running lily.
+- **Channels are projects.** Each channel (or Matrix room) is linked to a
+  project directory on the machine running lily.
 - **Threads are sessions.** Every message you send in a project channel starts
   a thread bound to one OpenCode session. Messages in the thread continue it.
 
-```
-  Discord server              Your machine
- ┌──────────────────┐        ┌──────────────────────────────────────┐
- │ #web-app ────────┼────────┼─▶ /code/web-app ─▶ session (thread)  │
- │ #api ────────────┼────────┼─▶ /code/api     ─▶ session (thread)  │
- └──────────────────┘        │        ▲ reads, edits, runs commands │
-       │ thread = session    │        ▼                             │
-       ▼ agent replies ◀─────┼── OpenCode server (any model)        │
- └──────────────────┘        └──────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph chat["Discord / Matrix"]
+        A["#web-app"]
+        B["#api"]
+        T["thread: fix login"]
+    end
+    subgraph machine["Your machine"]
+        W["/code/web-app"]
+        P["/code/api"]
+        OC["OpenCode server"]
+    end
+    A -- "channel = project" --> W
+    B -- "channel = project" --> P
+    T -- "thread = session" --> OC
+    OC -- "reads, edits, runs commands" --> W
+    OC -- "agent replies in the thread" --> T
 ```
 
 ## Setup
@@ -48,6 +55,12 @@ Configuration is environment-based: `DISCORD_TOKEN`, `OPENCODE_URL`
 (comma-separated Discord ids and/or Matrix MXIDs; when set, everyone else is
 ignored).
 
+**Authorization:** the bot runs agents on the host machine, so lock it down.
+Sensitive commands (`/add-project`, `/worktree`, `/delete-task`) default to
+members with **Manage Guild**; adjust per command in Server Settings →
+Integrations. For private setups, set `LILY_ALLOWED_USERS` to your own user id
+so no one else can start sessions at all.
+
 ### Matrix
 
 lily also speaks Matrix — rooms are projects, Matrix threads are sessions.
@@ -57,17 +70,11 @@ sets of variables). The login session persists in `~/.lily/matrix-session.json`
 and the bot auto-joins rooms it is invited to.
 
 Matrix has no slash commands, so commands are text: `!add-project <dir>`,
-`!queue <msg>`, `!clear-queue [n]`, `!btw <prompt>`, `!new-worktree [name]
-[base]`, `!merge-worktree [target]`, `!worktrees`, `!tasks`, `!cancel-task
-<id>`, `!help`. The `. queue` / `. btw` suffixes, queued-message editing
-(`m.replace`), and agent output as `m.notice` all work the same as on Discord.
-For scheduled tasks, `lily send --channel '!room:server'` targets a room.
-
-**Authorization:** the bot runs agents on the host machine, so lock it down.
-Sensitive commands (`/add-project`, `/new-worktree`, `/merge-worktree`,
-`/cancel-task`) default to members with **Manage Guild**; adjust per command in
-Server Settings → Integrations. For private setups, set `LILY_ALLOWED_USERS`
-to your own user id so no one else can start sessions at all.
+`!queue <msg>`, `!clear [n]`, `!btw <prompt>`, `!worktree [name] [base]`,
+`!list-worktrees`, `!tasks`, `!delete-task <id>`, `!help`. The `. queue` /
+`. btw` suffixes, queued-message editing (`m.replace`), and agent output as
+`m.notice` all work the same as on Discord. For scheduled tasks,
+`lily send --channel '!room:server'` targets a room.
 
 ## Message handling
 
@@ -75,6 +82,18 @@ A normal message sent while the agent is mid-run acts as an **interrupt**: if
 the current step is still going after ~3 seconds, lily aborts it and delivers
 your message, so a new instruction takes over instead of waiting behind a
 long-running command.
+
+```mermaid
+sequenceDiagram
+    participant U as You
+    participant L as lily
+    participant A as Agent
+    U->>L: new message (during a run)
+    Note over L: wait ~3s grace period
+    L->>A: abort current step
+    L->>A: deliver your message
+    A-->>U: replies in the thread
+```
 
 ## The queue
 
@@ -86,11 +105,11 @@ interrupting it:
   The suffix is stripped before the prompt reaches the agent.
 - If the session is busy you get the queue position; if it is idle the message
   dispatches immediately.
-- **Edit the queued Discord message** to update the queued prompt in place;
-  remove the `queue` suffix and the item is dropped from the queue.
+- **Edit the queued message** to update the queued prompt in place; remove the
+  `queue` suffix and the item is dropped from the queue.
 - When a queued message finally dispatches after waiting, it is shown as
   `» user: <prompt>`.
-- `/clear-queue [position]` clears everything or one entry.
+- `/clear [position]` clears everything or one entry.
 
 ## btw (side questions)
 
@@ -101,25 +120,27 @@ new `btw: <prompt>` thread and dispatches the question there immediately. The
 original thread is never paused. Unlike `queue`, the `btw` suffix requires
 punctuation or a newline before it.
 
+```mermaid
+flowchart LR
+    O["thread: build feature"] -->|keeps working| O2["...continues"]
+    O -->|". btw why pick X?"| F["thread: btw why pick X?"]
+    F -->|forked context, answers in parallel| F2["answer"]
+```
+
 ## Worktrees
 
 Move a session into an isolated git worktree so it never touches your main
 checkout:
 
-- `/new-worktree [name] [base-branch]` — from a thread, the name is derived
-  from the thread title (long names are compressed by stripping vowels:
+- `/worktree [name] [base-branch]` — from a thread, the name is derived from
+  the thread title (long names are compressed by stripping vowels:
   `configurable-sidebar-width` → `cnfgrbl-sdbr-wdth`); from a channel, pass a
   name and lily creates the thread immediately. The branch is `lily/<name>`,
   the worktree lives under `~/.lily/worktrees/`, the thread gets a
   `⬦ worktree:` prefix, and the existing session context is forked into the
-  worktree.
-- `/merge-worktree [target-branch]` — rebases the worktree commits onto the
-  target (default branch by default) and fast-forwards it, preserving all
-  commits. Requires clean worktree and target. On conflicts, lily asks the
-  agent **in the thread** to resolve them (`git add`, `git rebase --continue`),
-  then you run `/merge-worktree` again. On success the worktree and branch are
-  removed and the thread prefix is cleared.
-- `/worktrees` — list the project's worktrees (lily-created or not).
+  worktree. Merge the branch back whenever you like with your normal git
+  workflow (or ask the agent to do it).
+- `/list-worktrees` — list the project's worktrees (lily-created or not).
 
 ## Scheduled tasks
 
@@ -144,24 +165,25 @@ lily send --thread <thread-id> --prompt 'Check the deploy status' --send-at '@ho
 ```
 
 Manage tasks with `lily task list [--all]`, `lily task edit <id> [--prompt ...]
-[--send-at ...]`, `lily task delete <id>`, or from Discord with `/tasks` and
-`/cancel-task`. Without `--send-at`, `lily send` schedules the prompt to run on
+[--send-at ...]`, `lily task delete <id>`, or from chat with `/tasks` and
+`/delete-task`. Without `--send-at`, `lily send` schedules the prompt to run on
 the bot's next scheduler tick (~5s). The scheduler recovers tasks stranded in
 `running` after a crash and reschedules cron tasks after each run.
 
-## Slash commands
+## Commands
 
 | Command | Description |
 |---|---|
 | `/add-project <directory>` | Link the current channel to a project directory |
 | `/queue <message>` | Queue a message for after the current run |
-| `/clear-queue [position]` | Clear the queue, or one entry |
+| `/clear [position]` | Clear the queue, or one entry |
 | `/btw <prompt>` | Fork context into a new thread for a side question |
-| `/new-worktree [name] [base-branch]` | Move the session into an isolated worktree |
-| `/merge-worktree [target-branch]` | Rebase worktree commits back and clean up |
-| `/worktrees` | List worktrees for the channel's project |
+| `/worktree [name] [base-branch]` | Move the session into an isolated worktree |
+| `/list-worktrees` | List worktrees for the channel's project |
 | `/tasks` | List scheduled tasks |
-| `/cancel-task <id>` | Cancel a scheduled task |
+| `/delete-task <id>` | Delete a scheduled task |
+
+On Matrix the same commands are text commands (`!queue`, `!worktree`, ...).
 
 ## Architecture
 
@@ -169,34 +191,37 @@ The crate is layered domain-driven-design style. Dependencies point inward:
 `domain` depends on nothing, `application` orchestrates domain rules over
 connectors, `cli` wires it all together. The application layer talks to the
 chat platform only through the `ChatConnector` port (thread/message ids are
-opaque strings), so supporting another platform — e.g. Matrix via
-matrix-rust-sdk, where rooms map to projects and Matrix threads to sessions —
-means implementing one trait in a new connector.
+opaque strings), so supporting another platform means implementing one trait
+in a new connector.
 
-```text
-src/
-  main.rs                        thin entry point
-  cli/
-    mod.rs                       clap commands: run / project / send / task
-  domain/                        pure business rules, no I/O
-    delivery.rs                  `. queue` / `. btw` suffix semantics
-    rendering.rs                 2000-char markdown chunking, part rendering
-    session.rs                   queued messages, assistant-turn parts
-    task.rs                      schedule parsing (ISO/cron), task entities
-    worktree.rs                  naming rules, layout, merge outcomes
-  application/                   use cases
-    chat.rs                      the chat port: what lily needs from a platform
-    commands.rs                  platform-neutral command flows (btw, worktrees, tasks)
-    config.rs                    environment configuration
-    session_runtime.rs           per-thread runtime: queue, interrupt, dispatch
-    task_runner.rs               scheduled-task polling loop (5s tick, atomic claim)
-  connector/                     adapters to the outside world
-    discord.rs                   ChatConnector impl (serenity) + gateway events, slash commands
-    matrix.rs                    ChatConnector impl (matrix-sdk) + sync loop, !text commands
-    router.rs                    routes port calls by id shape when both run
-    opencode.rs                  OpenCode HTTP client + global SSE event listener
-    sqlite.rs                    persistence: projects, sessions, worktrees, tasks
-    git.rs                       worktree create / rebase-merge / list
+```mermaid
+flowchart TD
+    CLI["cli — clap commands, composition root"] --> APP
+    subgraph APP["application — use cases"]
+        CHAT["chat.rs (ChatConnector port)"]
+        CMD["commands.rs"]
+        RT["session_runtime.rs"]
+        TR["task_runner.rs"]
+    end
+    subgraph CON["connector — adapters"]
+        DC["discord.rs (serenity)"]
+        MX["matrix.rs (matrix-sdk)"]
+        OC["opencode.rs (HTTP + SSE)"]
+        SQ["sqlite.rs"]
+        GT["git.rs"]
+    end
+    subgraph DOM["domain — pure rules"]
+        DEL["delivery.rs"]
+        REN["rendering.rs"]
+        SES["session.rs"]
+        TSK["task.rs"]
+        WT["worktree.rs"]
+    end
+    APP --> DOM
+    APP --> CON
+    CON --> DOM
+    DC -. implements .-> CHAT
+    MX -. implements .-> CHAT
 ```
 
 State lives in SQLite at `~/.lily/lily.db`. The message queue is in-memory

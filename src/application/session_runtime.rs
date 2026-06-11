@@ -83,15 +83,6 @@ pub async fn get_or_create_runtime(
     Ok(rt)
 }
 
-/// Drop the session binding so the next message starts a fresh session (used
-/// after a merge removes the worktree directory the session lived in).
-pub async fn reset_session(state: &AppState, rt: &ThreadRuntime) -> Result<()> {
-    // Persist first; memory only changes once storage agrees.
-    state.db.delete_thread_session(&rt.thread_id)?;
-    rt.state.lock().await.session_id = None;
-    Ok(())
-}
-
 async fn send(chat: &dyn ChatConnector, thread_id: &str, content: &str) {
     if let Err(err) = chat.send_message(thread_id, content).await {
         tracing::warn!("failed to send message to {thread_id}: {err:#}");

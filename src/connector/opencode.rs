@@ -9,7 +9,7 @@
 //! - `GET  /event`                  SSE stream of bus events (shared globally)
 //!
 //! Requests are scoped to a project directory with the `x-opencode-directory`
-//! header, mirroring how the kimaki CLI drives the same server.
+//! header, scoping each request to its project.
 
 use crate::domain::session::Part;
 use anyhow::{anyhow, Context as _, Result};

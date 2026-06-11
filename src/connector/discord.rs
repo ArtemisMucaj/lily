@@ -226,7 +226,7 @@ async fn register_commands(http: &Http) -> Result<()> {
                 CreateCommandOption::new(CommandOptionType::String, "message", "The message to queue")
                     .required(true),
             ),
-        CreateCommand::new("clear-queue")
+        CreateCommand::new("clear")
             .description("Clear all queued messages, or one position")
             .add_option(CreateCommandOption::new(
                 CommandOptionType::Integer,
@@ -239,7 +239,7 @@ async fn register_commands(http: &Http) -> Result<()> {
                 CreateCommandOption::new(CommandOptionType::String, "prompt", "The side question")
                     .required(true),
             ),
-        CreateCommand::new("new-worktree")
+        CreateCommand::new("worktree")
             .description("Move this session into an isolated git worktree")
             .default_member_permissions(admin)
             .add_option(CreateCommandOption::new(
@@ -252,18 +252,11 @@ async fn register_commands(http: &Http) -> Result<()> {
                 "base-branch",
                 "Base ref for the worktree branch (defaults to HEAD)",
             )),
-        CreateCommand::new("merge-worktree")
-            .description("Rebase this thread's worktree commits back onto the default branch")
-            .default_member_permissions(admin)
-            .add_option(CreateCommandOption::new(
-                CommandOptionType::String,
-                "target-branch",
-                "Target branch (defaults to the project's default branch)",
-            )),
-        CreateCommand::new("worktrees").description("List worktrees for this channel's project"),
+        CreateCommand::new("list-worktrees")
+            .description("List worktrees for this channel's project"),
         CreateCommand::new("tasks").description("List scheduled tasks"),
-        CreateCommand::new("cancel-task")
-            .description("Cancel a scheduled task by id")
+        CreateCommand::new("delete-task")
+            .description("Delete a scheduled task by id")
             .default_member_permissions(admin)
             .add_option(
                 CreateCommandOption::new(CommandOptionType::Integer, "id", "Task id from /tasks")
@@ -504,13 +497,12 @@ impl Handler {
         match cmd.data.name.as_str() {
             "add-project" => self.cmd_add_project(ctx, cmd).await,
             "queue" => self.cmd_queue(ctx, cmd).await,
-            "clear-queue" => self.cmd_clear_queue(ctx, cmd).await,
+            "clear" => self.cmd_clear(ctx, cmd).await,
             "btw" => self.cmd_btw(ctx, cmd).await,
-            "new-worktree" => self.cmd_new_worktree(ctx, cmd).await,
-            "merge-worktree" => self.cmd_merge_worktree(ctx, cmd).await,
-            "worktrees" => self.cmd_worktrees(ctx, cmd).await,
+            "worktree" => self.cmd_worktree(ctx, cmd).await,
+            "list-worktrees" => self.cmd_list_worktrees(ctx, cmd).await,
             "tasks" => self.cmd_tasks(ctx, cmd).await,
-            "cancel-task" => self.cmd_cancel_task(ctx, cmd).await,
+            "delete-task" => self.cmd_delete_task(ctx, cmd).await,
             other => Err(anyhow!("unknown command: {other}")),
         }
     }
@@ -564,7 +556,7 @@ impl Handler {
         }
     }
 
-    async fn cmd_clear_queue(&self, ctx: &Context, cmd: &CommandInteraction) -> Result<()> {
+    async fn cmd_clear(&self, ctx: &Context, cmd: &CommandInteraction) -> Result<()> {
         let position = int_option(cmd, "position").map(|i| i.max(0) as usize);
         let rt = self.thread_runtime(ctx, cmd).await?;
         let removed = runner::clear_queue(&rt, position).await?;
@@ -598,7 +590,7 @@ impl Handler {
         followup(ctx, cmd, format!("Session forked! Continue in <#{thread_id}>")).await
     }
 
-    async fn cmd_new_worktree(&self, ctx: &Context, cmd: &CommandInteraction) -> Result<()> {
+    async fn cmd_worktree(&self, ctx: &Context, cmd: &CommandInteraction) -> Result<()> {
         let channel = self.guild_channel(ctx, cmd.channel_id).await?;
         let scope = if Self::is_thread(channel.kind) {
             commands::WorktreeScope::Thread {
@@ -622,24 +614,7 @@ impl Handler {
         respond(ctx, cmd, reply).await
     }
 
-    async fn cmd_merge_worktree(&self, ctx: &Context, cmd: &CommandInteraction) -> Result<()> {
-        let channel = self.guild_channel(ctx, cmd.channel_id).await?;
-        if !Self::is_thread(channel.kind) {
-            return Err(anyhow!("/merge-worktree only works inside a worktree thread"));
-        }
-        defer(ctx, cmd).await?;
-        let reply = commands::merge_worktree(
-            &self.state,
-            &self.chat(ctx),
-            &cmd.channel_id.to_string(),
-            &channel.name,
-            str_option(cmd, "target-branch"),
-        )
-        .await?;
-        followup(ctx, cmd, reply).await
-    }
-
-    async fn cmd_worktrees(&self, ctx: &Context, cmd: &CommandInteraction) -> Result<()> {
+    async fn cmd_list_worktrees(&self, ctx: &Context, cmd: &CommandInteraction) -> Result<()> {
         let channel = self.guild_channel(ctx, cmd.channel_id).await?;
         let channel_id = if Self::is_thread(channel.kind) {
             channel.parent_id.ok_or_else(|| anyhow!("thread has no parent"))?.to_string()
@@ -653,9 +628,9 @@ impl Handler {
         respond(ctx, cmd, commands::tasks_text(&self.state)?).await
     }
 
-    async fn cmd_cancel_task(&self, ctx: &Context, cmd: &CommandInteraction) -> Result<()> {
+    async fn cmd_delete_task(&self, ctx: &Context, cmd: &CommandInteraction) -> Result<()> {
         let id = int_option(cmd, "id").ok_or_else(|| anyhow!("id is required"))?;
-        respond(ctx, cmd, commands::cancel_task_text(&self.state, id)?).await
+        respond(ctx, cmd, commands::delete_task_text(&self.state, id)?).await
     }
 }
 

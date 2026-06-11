@@ -1,6 +1,5 @@
-//! Worktree domain: naming rules, on-disk layout, merge outcomes, and the
-//! conflict-resolution instructions handed to the agent. The git plumbing
-//! that acts on these lives in `connector::git`.
+//! Worktree domain: naming rules and on-disk layout. The git plumbing that
+//! acts on these lives in `connector::git`.
 
 use std::path::{Path, PathBuf};
 
@@ -15,29 +14,8 @@ pub struct ThreadWorktree {
     pub thread_id: String,
     pub worktree_name: String,
     pub worktree_directory: Option<String>,
-    pub project_directory: String,
     pub status: String,
     pub error_message: Option<String>,
-}
-
-/// Result of merging a worktree back onto its target branch.
-#[derive(Debug)]
-pub enum MergeOutcome {
-    Success {
-        target_branch: String,
-        branch_name: String,
-        commit_count: u64,
-        short_sha: String,
-        /// Set when the merge landed but post-merge cleanup (branch delete,
-        /// worktree removal) partially failed and may need manual attention.
-        cleanup_warning: Option<String>,
-    },
-    /// Rebase stopped on conflicts; git is left mid-rebase so the agent can
-    /// resolve them, after which /merge-worktree is run again.
-    RebaseConflict { target_branch: String },
-    DirtyWorktree,
-    TargetDirty { target_branch: String },
-    NothingToMerge,
 }
 
 fn fnv1a64(data: &str) -> u64 {
@@ -93,18 +71,6 @@ pub fn branch_name(slug: &str) -> String {
 pub fn worktree_directory(data_dir: &Path, project_directory: &str, slug: &str) -> PathBuf {
     let hash = format!("{:08x}", fnv1a64(project_directory) & 0xffff_ffff);
     data_dir.join("worktrees").join(hash).join(slug)
-}
-
-/// Prompt sent to the agent when a merge rebase hits conflicts.
-pub fn conflict_resolution_prompt(target_branch: &str) -> String {
-    format!(
-        "The rebase onto `{target_branch}` stopped on conflicts. Resolve them: \
-         run `git status` to find conflicted files, understand both sides using \
-         the merge base and commit messages, edit the files to resolve every \
-         conflict marker, `git add` them, then `git rebase --continue`. Repeat \
-         until the rebase completes. Do not abort the rebase. When it is done, \
-         tell the user to run /merge-worktree again to complete the merge."
-    )
 }
 
 #[cfg(test)]

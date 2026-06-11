@@ -5,7 +5,6 @@
 
 use crate::application::chat::ChatConnector;
 use crate::application::session_runtime::{self as runner, AppState};
-use crate::application::task_runner;
 use crate::connector::git;
 use crate::domain::rendering;
 use crate::domain::session::QueuedMessage;
@@ -91,7 +90,7 @@ pub async fn fork_btw(
     Ok(thread_id)
 }
 
-/// Where /new-worktree was invoked from.
+/// Where the worktree command was invoked from.
 pub enum WorktreeScope {
     /// Inside an existing session thread; the name falls back to a compressed
     /// slug of `name_hint` (typically the thread title).
@@ -215,103 +214,6 @@ pub async fn new_worktree(
     Ok(reply)
 }
 
-/// Rebase this thread's worktree back onto the target branch. Returns the
-/// reply text; on conflicts the agent is asked (in the thread) to resolve
-/// them.
-pub async fn merge_worktree(
-    state: &Arc<AppState>,
-    chat: &Arc<dyn ChatConnector>,
-    thread_id: &str,
-    thread_name: &str,
-    target_branch: Option<String>,
-) -> Result<String> {
-    let wt = state
-        .db
-        .get_thread_worktree(thread_id)?
-        .ok_or_else(|| anyhow!("this thread has no worktree (use new-worktree first)"))?;
-    if wt.status != "ready" {
-        let detail = wt.error_message.clone().map(|e| format!(": {e}")).unwrap_or_default();
-        return Err(anyhow!("worktree is not ready (status: {}{detail})", wt.status));
-    }
-    let wt_dir = wt
-        .worktree_directory
-        .clone()
-        .ok_or_else(|| anyhow!("worktree directory missing"))?;
-    let slug = wt
-        .worktree_name
-        .strip_prefix(worktree::BRANCH_PREFIX)
-        .unwrap_or(&wt.worktree_name)
-        .to_string();
-    let target = match target_branch {
-        Some(t) => t,
-        None => git::default_branch(&wt.project_directory).await?,
-    };
-
-    let outcome = git::merge_worktree(
-        std::path::Path::new(&wt_dir),
-        &wt.project_directory,
-        &slug,
-        &target,
-    )
-    .await?;
-
-    match outcome {
-        worktree::MergeOutcome::Success {
-            target_branch,
-            branch_name,
-            commit_count,
-            short_sha,
-            cleanup_warning,
-        } => {
-            state.db.delete_thread_worktree(thread_id)?;
-            // The worktree directory is gone: retarget the runtime back at
-            // the project (keeping its queue) and drop the session that was
-            // bound to the removed directory.
-            let rt =
-                runner::get_or_create_runtime(state, thread_id, wt.project_directory.clone()).await?;
-            runner::reset_session(state, &rt).await?;
-            if let Some(stripped) = thread_name.strip_prefix(worktree::THREAD_PREFIX.trim_end()) {
-                let _ = chat
-                    .rename_thread(thread_id, stripped.trim_start_matches([' ', ':']))
-                    .await;
-            }
-            let warning = cleanup_warning
-                .map(|w| format!("\n⚠️ Cleanup needs attention: {w}"))
-                .unwrap_or_default();
-            Ok(format!(
-                "Merged {commit_count} commit(s) from `{branch_name}` into `{target_branch}` (now at `{short_sha}`). Worktree removed.{warning}"
-            ))
-        }
-        worktree::MergeOutcome::RebaseConflict { target_branch } => {
-            let directory = task_runner::resolve_thread_directory(state, chat.as_ref(), thread_id).await?;
-            let rt = runner::get_or_create_runtime(state, thread_id, directory).await?;
-            runner::enqueue_incoming(
-                state.clone(),
-                chat.clone(),
-                rt,
-                QueuedMessage {
-                    prompt: worktree::conflict_resolution_prompt(&target_branch),
-                    username: "lily".to_string(),
-                    source_message_id: None,
-                    show_marker: false,
-                },
-                false,
-            )
-            .await;
-            Ok(format!(
-                "Rebase onto `{target_branch}` hit conflicts. Asking the agent to resolve them; run merge-worktree again once it finishes."
-            ))
-        }
-        worktree::MergeOutcome::DirtyWorktree => {
-            Ok("The worktree has uncommitted changes. Commit or stash them first.".to_string())
-        }
-        worktree::MergeOutcome::TargetDirty { target_branch } => Ok(format!(
-            "`{target_branch}` is checked out with uncommitted changes in the main repo. Clean it up first."
-        )),
-        worktree::MergeOutcome::NothingToMerge => Ok("No commits to merge yet.".to_string()),
-    }
-}
-
 /// List the project's worktrees (lily-created or not) for a channel.
 pub async fn worktrees_text(state: &AppState, channel_id: &str) -> Result<String> {
     let project = state
@@ -325,7 +227,7 @@ pub async fn worktrees_text(state: &AppState, channel_id: &str) -> Result<String
         let meta = db_list
             .iter()
             .find(|w| w.worktree_directory.as_deref() == Some(path.as_str()))
-            .map(|w| format!(" — lily thread {} ({})", w.thread_id, w.status))
+            .map(|w| format!(" — lily thread {} [{}] ({})", w.thread_id, w.worktree_name, w.status))
             .unwrap_or_default();
         lines.push(format!("- `{path}` on `{branch}`{meta}"));
     }
@@ -345,10 +247,10 @@ pub fn tasks_text(state: &AppState) -> Result<String> {
     Ok(format!("Scheduled tasks:\n{}", lines.join("\n")))
 }
 
-/// Cancel a scheduled task by id.
-pub fn cancel_task_text(state: &AppState, id: i64) -> Result<String> {
+/// Delete (cancel) a scheduled task by id.
+pub fn delete_task_text(state: &AppState, id: i64) -> Result<String> {
     if state.db.cancel_task(id)? {
-        Ok(format!("Cancelled task #{id}"))
+        Ok(format!("Deleted task #{id}"))
     } else {
         Ok(format!("Task #{id} is not planned or running"))
     }

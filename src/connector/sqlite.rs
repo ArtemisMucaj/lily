@@ -135,13 +135,6 @@ impl Db {
         })
     }
 
-    pub fn delete_thread_session(&self, thread_id: &str) -> Result<()> {
-        self.with(|c| {
-            c.execute("DELETE FROM thread_sessions WHERE thread_id = ?1", params![thread_id])?;
-            Ok(())
-        })
-    }
-
     pub fn get_thread_session(&self, thread_id: &str) -> Result<Option<String>> {
         self.with(|c| {
             Ok(c.query_row(
@@ -199,7 +192,7 @@ impl Db {
     pub fn get_thread_worktree(&self, thread_id: &str) -> Result<Option<ThreadWorktree>> {
         self.with(|c| {
             Ok(c.query_row(
-                "SELECT thread_id, worktree_name, worktree_directory, project_directory, status, error_message
+                "SELECT thread_id, worktree_name, worktree_directory, status, error_message
                  FROM thread_worktrees WHERE thread_id = ?1",
                 params![thread_id],
                 |r| {
@@ -207,9 +200,8 @@ impl Db {
                         thread_id: r.get(0)?,
                         worktree_name: r.get(1)?,
                         worktree_directory: r.get(2)?,
-                        project_directory: r.get(3)?,
-                        status: r.get(4)?,
-                        error_message: r.get(5)?,
+                        status: r.get(3)?,
+                        error_message: r.get(4)?,
                     })
                 },
             )
@@ -217,17 +209,10 @@ impl Db {
         })
     }
 
-    pub fn delete_thread_worktree(&self, thread_id: &str) -> Result<()> {
-        self.with(|c| {
-            c.execute("DELETE FROM thread_worktrees WHERE thread_id = ?1", params![thread_id])?;
-            Ok(())
-        })
-    }
-
     pub fn list_worktrees_for_project(&self, project_directory: &str) -> Result<Vec<ThreadWorktree>> {
         self.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT thread_id, worktree_name, worktree_directory, project_directory, status, error_message
+                "SELECT thread_id, worktree_name, worktree_directory, status, error_message
                  FROM thread_worktrees WHERE project_directory = ?1",
             )?;
             let rows = stmt
@@ -236,9 +221,8 @@ impl Db {
                         thread_id: r.get(0)?,
                         worktree_name: r.get(1)?,
                         worktree_directory: r.get(2)?,
-                        project_directory: r.get(3)?,
-                        status: r.get(4)?,
-                        error_message: r.get(5)?,
+                        status: r.get(3)?,
+                        error_message: r.get(4)?,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;

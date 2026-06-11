@@ -408,7 +408,7 @@ async fn handle_command(
                 EnqueueResult::Dispatched => "Session was idle; message sent immediately.".to_string(),
             })
         }
-        "clear-queue" => {
+        "clear" => {
             let thread_id = need_thread()?;
             let position = if args.is_empty() { None } else { Some(args.parse::<usize>()?) };
             let directory =
@@ -431,7 +431,7 @@ async fn handle_command(
                 .await?;
             Ok("Session forked! Continue in the new btw thread.".to_string())
         }
-        "new-worktree" => {
+        "worktree" => {
             let mut parts = args.split_whitespace();
             let name = parts.next().map(str::to_string);
             let base = parts.next().map(str::to_string);
@@ -447,20 +447,15 @@ async fn handle_command(
             };
             commands::new_worktree(state, chat, scope, name, base).await
         }
-        "merge-worktree" => {
-            let thread_id = need_thread()?;
-            let target = if args.is_empty() { None } else { Some(args.to_string()) };
-            commands::merge_worktree(state, chat, thread_id, "", target).await
-        }
-        "worktrees" => commands::worktrees_text(state, room_id).await,
+        "list-worktrees" => commands::worktrees_text(state, room_id).await,
         "tasks" => commands::tasks_text(state),
-        "cancel-task" => {
-            let id: i64 = args.parse().context("usage: !cancel-task <id>")?;
-            commands::cancel_task_text(state, id)
+        "delete-task" => {
+            let id: i64 = args.parse().context("usage: !delete-task <id>")?;
+            commands::delete_task_text(state, id)
         }
-        "help" => Ok("Commands: !add-project <dir>, !queue <msg>, !clear-queue [n], !btw <prompt>, \
-                      !new-worktree [name] [base], !merge-worktree [target], !worktrees, !tasks, \
-                      !cancel-task <id>. Suffixes: end a message with `. queue` or `. btw`."
+        "help" => Ok("Commands: !add-project <dir>, !queue <msg>, !clear [n], !btw <prompt>, \
+                      !worktree [name] [base], !list-worktrees, !tasks, !delete-task <id>. \
+                      Suffixes: end a message with `. queue` or `. btw`."
             .to_string()),
         other => Err(anyhow!("unknown command !{other} (try !help)")),
     }
