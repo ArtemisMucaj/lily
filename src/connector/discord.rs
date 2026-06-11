@@ -5,11 +5,14 @@
 //! - Slash commands implement project linking, the queue, btw forks, and
 //!   worktree management.
 
-use crate::format;
-use crate::runner::{self, AppState, EnqueueResult, QueueEditOutcome, QueuedMessage};
-use crate::scheduler;
-use crate::suffix::{self, Delivery};
-use crate::worktree;
+use crate::application::session_runtime::{self as runner, AppState};
+use crate::application::task_runner;
+use crate::connector::git;
+use crate::domain::delivery::{self, Delivery};
+use crate::domain::rendering;
+use crate::domain::session::{EnqueueResult, QueueEditOutcome, QueuedMessage};
+use crate::domain::task::describe_task;
+use crate::domain::worktree;
 use anyhow::{anyhow, Context as _, Result};
 use serenity::all::{
     AutoArchiveDuration, ChannelId, ChannelType, Command, CommandInteraction, CommandOptionType,
@@ -227,8 +230,8 @@ impl Handler {
             // Not a project channel; stay quiet.
             return Ok(());
         };
-        let parsed = suffix::parse_message(&msg.content);
-        let thread_name = format::prompt_preview(&parsed.prompt, 80);
+        let parsed = delivery::parse_message(&msg.content);
+        let thread_name = rendering::prompt_preview(&parsed.prompt, 80);
         let thread = msg
             .channel_id
             .create_thread_from_message(
@@ -267,8 +270,8 @@ impl Handler {
         thread: &GuildChannel,
     ) -> Result<()> {
         let directory =
-            scheduler::resolve_thread_directory(&self.state, &ctx.http, msg.channel_id).await?;
-        let parsed = suffix::parse_message(&msg.content);
+            task_runner::resolve_thread_directory(&self.state, &ctx.http, msg.channel_id).await?;
+        let parsed = delivery::parse_message(&msg.content);
         let rt = runner::get_or_create_runtime(&self.state, msg.channel_id, directory.clone()).await;
 
         match parsed.delivery {
@@ -342,7 +345,7 @@ impl Handler {
             return Ok(());
         }
         let Ok(directory) =
-            scheduler::resolve_thread_directory(&self.state, &ctx.http, channel_id).await
+            task_runner::resolve_thread_directory(&self.state, &ctx.http, channel_id).await
         else {
             return Ok(());
         };
@@ -388,7 +391,7 @@ impl Handler {
             .await
             .context("failed to fork session")?;
 
-        let name = format!("btw: {}", format::prompt_preview(prompt, 90));
+        let name = format!("btw: {}", rendering::prompt_preview(prompt, 90));
         let thread = parent_channel
             .create_thread(
                 &ctx.http,
@@ -483,7 +486,7 @@ impl Handler {
             return Err(anyhow!("this command only works inside a session thread"));
         }
         let directory =
-            scheduler::resolve_thread_directory(&self.state, &ctx.http, cmd.channel_id).await?;
+            task_runner::resolve_thread_directory(&self.state, &ctx.http, cmd.channel_id).await?;
         Ok(runner::get_or_create_runtime(&self.state, cmd.channel_id, directory).await)
     }
 
@@ -527,7 +530,7 @@ impl Handler {
         }
         let parent = channel.parent_id.ok_or_else(|| anyhow!("thread has no parent channel"))?;
         let directory =
-            scheduler::resolve_thread_directory(&self.state, &ctx.http, cmd.channel_id).await?;
+            task_runner::resolve_thread_directory(&self.state, &ctx.http, cmd.channel_id).await?;
         defer(ctx, cmd).await?;
         let thread_id = self
             .fork_btw(ctx, cmd.channel_id, parent, &directory, &prompt, cmd.user.id.get(), &cmd.user.name)
@@ -601,7 +604,7 @@ impl Handler {
         let in_thread = Self::is_thread(channel.kind);
         let channel_name = channel.name.clone();
         tokio::spawn(async move {
-            let result = worktree::create_worktree(
+            let result = git::create_worktree(
                 &project_directory,
                 &wt_dir,
                 &slug,
@@ -675,11 +678,11 @@ impl Handler {
             .to_string();
         let target = match str_option(cmd, "target-branch") {
             Some(t) => t,
-            None => worktree::default_branch(&wt.project_directory).await?,
+            None => git::default_branch(&wt.project_directory).await?,
         };
         defer(ctx, cmd).await?;
 
-        let outcome = worktree::merge_worktree(
+        let outcome = git::merge_worktree(
             std::path::Path::new(&wt_dir),
             &wt.project_directory,
             &slug,
@@ -713,7 +716,7 @@ impl Handler {
                 )
                 .await?;
                 let directory =
-                    scheduler::resolve_thread_directory(&self.state, &ctx.http, cmd.channel_id).await?;
+                    task_runner::resolve_thread_directory(&self.state, &ctx.http, cmd.channel_id).await?;
                 let rt = runner::get_or_create_runtime(&self.state, cmd.channel_id, directory).await;
                 runner::enqueue_incoming(
                     self.state.clone(),
@@ -759,7 +762,7 @@ impl Handler {
             .db
             .get_channel_directory(&channel_id.to_string())?
             .ok_or_else(|| anyhow!("this channel is not linked to a project"))?;
-        let git_list = worktree::list_worktrees(&project).await?;
+        let git_list = git::list_worktrees(&project).await?;
         let db_list = self.state.db.list_worktrees_for_project(&project)?;
         let mut lines = vec![format!("Worktrees for `{project}`:")];
         for (path, branch) in &git_list {
@@ -781,7 +784,7 @@ impl Handler {
         if tasks.is_empty() {
             return respond(ctx, cmd, "No scheduled tasks. Create one with `lily send --send-at ...`.").await;
         }
-        let lines: Vec<String> = tasks.iter().map(scheduler::describe_task).collect();
+        let lines: Vec<String> = tasks.iter().map(describe_task).collect();
         respond(ctx, cmd, format!("Scheduled tasks:\n{}", lines.join("\n"))).await
     }
 

@@ -5,10 +5,12 @@
 //! while a run is active either wait in the queue (`. queue`) or interrupt the
 //! run after a grace period (normal messages).
 
-use crate::config::Config;
-use crate::db::Db;
-use crate::format;
-use crate::opencode::OpencodeClient;
+use crate::application::config::Config;
+use crate::connector::opencode::OpencodeClient;
+use crate::connector::sqlite::Db;
+use crate::domain::delivery::{self, Delivery};
+use crate::domain::rendering;
+use crate::domain::session::{EnqueueResult, QueueEditOutcome, QueuedMessage};
 use anyhow::{anyhow, Result};
 use serenity::all::{ChannelId, CreateMessage, Http, MessageFlags, MessageId};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -27,25 +29,6 @@ impl AppState {
     pub fn new(db: Arc<Db>, oc: OpencodeClient, config: Config) -> Self {
         Self { db, oc, config, runtimes: Mutex::new(HashMap::new()) }
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct QueuedMessage {
-    pub prompt: String,
-    pub username: String,
-    /// Discord message that produced this entry; used so editing the message
-    /// updates (or removes) the queued prompt.
-    pub source_message_id: Option<MessageId>,
-    /// Show the `»` dispatched-from-queue marker when this entry had to wait.
-    pub show_marker: bool,
-}
-
-#[derive(Debug)]
-pub enum EnqueueResult {
-    /// Dispatch started immediately.
-    Dispatched,
-    /// Waiting behind the current run; 1-based position.
-    Queued(usize),
 }
 
 pub struct ThreadRuntime {
@@ -88,7 +71,7 @@ pub async fn remove_runtime(state: &Arc<AppState>, thread_id: ChannelId) {
 }
 
 async fn send_silent(http: &Http, channel: ChannelId, content: &str) {
-    for chunk in format::split_markdown(content, format::DISCORD_MESSAGE_LIMIT) {
+    for chunk in rendering::split_markdown(content, rendering::DISCORD_MESSAGE_LIMIT) {
         let msg = CreateMessage::new()
             .content(chunk)
             .flags(MessageFlags::SUPPRESS_NOTIFICATIONS);
@@ -164,11 +147,11 @@ async fn dispatch_loop(
     let mut current = first;
     loop {
         if current.show_marker {
-            let preview = format::prompt_preview(&current.prompt, 150);
+            let preview = rendering::prompt_preview(&current.prompt, 150);
             send_silent(
                 &http,
                 rt.thread_id,
-                &format!("{}**{}:** {}", format::QUEUE_PREFIX, current.username, preview),
+                &format!("{}**{}:** {}", rendering::QUEUE_PREFIX, current.username, preview),
             )
             .await;
         }
@@ -234,7 +217,7 @@ async fn run_prompt(
                 else {
                     continue;
                 };
-                let Some(part) = crate::opencode::part_from_event(part_value) else { continue };
+                let Some(part) = crate::connector::opencode::part_from_event(part_value) else { continue };
                 // Text parts are rendered at the end of the run.
                 if part.kind == "text" {
                     continue;
@@ -253,7 +236,7 @@ async fn run_prompt(
                 if status != "completed" && status != "error" {
                     continue;
                 }
-                if let Some(line) = format::format_part(&part) {
+                if let Some(line) = rendering::format_part(&part) {
                     send_silent(&http, thread_id, &line).await;
                 }
             }
@@ -282,7 +265,7 @@ async fn run_prompt(
         if part.kind != "text" {
             continue;
         }
-        if let Some(text) = format::format_part(part) {
+        if let Some(text) = rendering::format_part(part) {
             send_silent(http, rt.thread_id, &text).await;
             sent_anything = true;
         }
@@ -290,18 +273,11 @@ async fn run_prompt(
     if !sent_anything {
         send_silent(http, rt.thread_id, "⬥ (no reply text)").await;
     }
-    send_silent(http, rt.thread_id, &format::turn_footer(started.elapsed())).await;
+    send_silent(http, rt.thread_id, &rendering::turn_footer(started.elapsed())).await;
     Ok(())
 }
 
 // ---- queue management (edits, clears) ----
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum QueueEditOutcome {
-    Updated,
-    Removed,
-    NotFound,
-}
 
 /// Apply an edit of a Discord message to its queued entry: new text with the
 /// queue suffix keeps it (updated), losing the suffix drops it.
@@ -310,7 +286,7 @@ pub async fn update_queue_item_for_edit(
     source_message_id: MessageId,
     new_content: &str,
 ) -> QueueEditOutcome {
-    let parsed = crate::suffix::parse_message(new_content);
+    let parsed = delivery::parse_message(new_content);
     let mut s = rt.state.lock().await;
     let Some(pos) = s
         .queue
@@ -319,7 +295,7 @@ pub async fn update_queue_item_for_edit(
     else {
         return QueueEditOutcome::NotFound;
     };
-    if matches!(parsed.delivery, crate::suffix::Delivery::Queue) {
+    if matches!(parsed.delivery, Delivery::Queue) {
         s.queue[pos].prompt = parsed.prompt;
         QueueEditOutcome::Updated
     } else {

@@ -1,9 +1,11 @@
-//! SQLite persistence: channel↔directory mapping, thread↔session mapping,
-//! worktree state, and scheduled tasks.
+//! SQLite adapter: persists channel↔directory mappings, thread↔session
+//! mappings, worktree state, and scheduled tasks. Entities live in `domain`.
 //!
 //! The queue itself is in-memory (per-thread runtime state); only durable
 //! orchestration state lives here.
 
+use crate::domain::task::{NewScheduledTask, ScheduledTask};
+use crate::domain::worktree::ThreadWorktree;
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -17,47 +19,6 @@ pub struct Db {
 /// `(schedule_kind, run_at, cron_expr, timezone, next_run_at)` for task edits.
 pub type ScheduleUpdate<'a> =
     (&'a str, Option<DateTime<Utc>>, Option<&'a str>, Option<&'a str>, DateTime<Utc>);
-
-#[derive(Debug, Clone)]
-pub struct ThreadWorktree {
-    pub thread_id: String,
-    pub worktree_name: String,
-    pub worktree_directory: Option<String>,
-    pub project_directory: String,
-    pub status: String,
-    pub error_message: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ScheduledTask {
-    pub id: i64,
-    pub status: String,
-    pub schedule_kind: String,
-    pub run_at: Option<DateTime<Utc>>,
-    pub cron_expr: Option<String>,
-    pub timezone: Option<String>,
-    pub next_run_at: DateTime<Utc>,
-    pub last_run_at: Option<DateTime<Utc>>,
-    pub last_error: Option<String>,
-    pub attempts: i64,
-    pub payload_json: String,
-    pub prompt_preview: String,
-    pub channel_id: Option<String>,
-    pub thread_id: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct NewScheduledTask {
-    pub schedule_kind: String,
-    pub run_at: Option<DateTime<Utc>>,
-    pub cron_expr: Option<String>,
-    pub timezone: Option<String>,
-    pub next_run_at: DateTime<Utc>,
-    pub payload_json: String,
-    pub prompt_preview: String,
-    pub channel_id: Option<String>,
-    pub thread_id: Option<String>,
-}
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS channel_directories (

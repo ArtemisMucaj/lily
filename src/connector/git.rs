@@ -1,31 +1,12 @@
-//! Git worktree management: isolate a session's work in a separate checkout,
-//! then rebase the commits back onto the default branch.
+//! Git adapter: executes the worktree lifecycle (create, rebase-merge, list)
+//! by shelling out to `git`. Naming rules and outcome types live in
+//! `domain::worktree`.
 
+use crate::domain::worktree::{branch_name, MergeOutcome};
 use anyhow::{anyhow, Context as _, Result};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use tokio::process::Command;
-
-/// Branch prefix for worktrees created by lily.
-pub const BRANCH_PREFIX: &str = "lily/";
-/// Thread title prefix marking an unmerged worktree thread.
-pub const THREAD_PREFIX: &str = "⬦ worktree: ";
-
-#[derive(Debug)]
-pub enum MergeOutcome {
-    Success {
-        target_branch: String,
-        branch_name: String,
-        commit_count: u64,
-        short_sha: String,
-    },
-    /// Rebase stopped on conflicts; git is left mid-rebase so the agent can
-    /// resolve them, after which /merge-worktree is run again.
-    RebaseConflict { target_branch: String },
-    DirtyWorktree,
-    TargetDirty { target_branch: String },
-    NothingToMerge,
-}
 
 async fn git(dir: &Path, args: &[&str]) -> Result<Output> {
     let out = Command::new("git")
@@ -47,61 +28,6 @@ async fn git_ok(dir: &Path, args: &[&str]) -> Result<String> {
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-fn fnv1a64(data: &str) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for b in data.as_bytes() {
-        hash ^= u64::from(*b);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
-
-/// Lowercase, collapse whitespace to dashes, drop anything but [a-z0-9-].
-pub fn slugify(name: &str) -> String {
-    let mut slug = String::new();
-    let mut last_dash = true;
-    for ch in name.to_lowercase().chars() {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch);
-            last_dash = false;
-        } else if !last_dash {
-            slug.push('-');
-            last_dash = true;
-        }
-    }
-    slug.trim_matches('-').to_string()
-}
-
-/// Compress long auto-derived slugs by stripping vowels from each word,
-/// keeping the first letter: `configurable-sidebar-width` → `cnfgrbl-sdbr-wdth`.
-pub fn compress_slug(slug: &str) -> String {
-    if slug.len() <= 20 {
-        return slug.to_string();
-    }
-    slug.split('-')
-        .map(|word| {
-            let mut out = String::new();
-            for (i, ch) in word.chars().enumerate() {
-                if i == 0 || !matches!(ch, 'a' | 'e' | 'i' | 'o' | 'u') {
-                    out.push(ch);
-                }
-            }
-            out
-        })
-        .collect::<Vec<_>>()
-        .join("-")
-}
-
-pub fn branch_name(slug: &str) -> String {
-    format!("{BRANCH_PREFIX}{slug}")
-}
-
-/// Directory for a worktree: `<data_dir>/worktrees/<project-hash>/<slug>`.
-pub fn worktree_directory(data_dir: &Path, project_directory: &str, slug: &str) -> PathBuf {
-    let hash = format!("{:08x}", fnv1a64(project_directory) & 0xffff_ffff);
-    data_dir.join("worktrees").join(hash).join(slug)
 }
 
 /// Create a worktree on a fresh branch. `base_ref` defaults to HEAD so the
@@ -263,18 +189,6 @@ pub async fn merge_worktree(
     })
 }
 
-/// Prompt sent to the agent when a merge rebase hits conflicts.
-pub fn conflict_resolution_prompt(target_branch: &str) -> String {
-    format!(
-        "The rebase onto `{target_branch}` stopped on conflicts. Resolve them: \
-         run `git status` to find conflicted files, understand both sides using \
-         the merge base and commit messages, edit the files to resolve every \
-         conflict marker, `git add` them, then `git rebase --continue`. Repeat \
-         until the rebase completes. Do not abort the rebase. When it is done, \
-         tell the user to run /merge-worktree again to complete the merge."
-    )
-}
-
 /// Worktrees of a project as reported by git itself.
 pub async fn list_worktrees(project_directory: &str) -> Result<Vec<(String, String)>> {
     let raw = git_ok(Path::new(project_directory), &["worktree", "list", "--porcelain"]).await?;
@@ -297,20 +211,141 @@ pub async fn list_worktrees(project_directory: &str) -> Result<Vec<(String, Stri
 
 #[cfg(test)]
 mod tests {
+    //! Lifecycle tests against a real git repository in a temp directory.
+
     use super::*;
+    use crate::domain::worktree::worktree_directory;
+    use std::process::Command;
 
-    #[test]
-    fn slugify_basic() {
-        assert_eq!(slugify("Redesign  the Sidebar!"), "redesign-the-sidebar");
+    fn run_git(dir: &Path, args: &[&str]) {
+        // Some CI environments enforce commit signing; tests don't need it.
+        let mut full = vec!["-c", "commit.gpgsign=false"];
+        full.extend_from_slice(args);
+        let out = Command::new("git")
+            .args(&full)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .current_dir(dir)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
-    #[test]
-    fn compress_strips_vowels_keeping_first_letter() {
-        assert_eq!(compress_slug("configurable-sidebar-width"), "cnfgrbl-sdbr-wdth");
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git").args(args).current_dir(dir).output().expect("spawn git");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    #[test]
-    fn compress_keeps_short_slugs() {
-        assert_eq!(compress_slug("fix-login"), "fix-login");
+    fn setup_repo(root: &Path) -> PathBuf {
+        let repo = root.join("project");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-b", "main"]);
+        std::fs::write(repo.join("file.txt"), "hello\n").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "initial"]);
+        repo
+    }
+
+    fn tempdir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lily-wt-test-{}", std::process::id())).join(
+            format!(
+                "{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ),
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn create_commit_and_merge_worktree() {
+        let tmp = tempdir();
+        let repo = setup_repo(&tmp);
+        let data_dir = tmp.join("data");
+
+        let slug = "test-feature";
+        let wt_dir = worktree_directory(&data_dir, repo.to_str().unwrap(), slug);
+        create_worktree(repo.to_str().unwrap(), &wt_dir, slug, None)
+            .await
+            .expect("create worktree");
+        assert!(wt_dir.join("file.txt").exists());
+        assert_eq!(git_out(&wt_dir, &["symbolic-ref", "--short", "HEAD"]), "lily/test-feature");
+
+        // Commit in the worktree, then merge back.
+        std::fs::write(wt_dir.join("new.txt"), "feature work\n").unwrap();
+        run_git(&wt_dir, &["add", "."]);
+        run_git(&wt_dir, &["commit", "-m", "add feature"]);
+
+        let outcome = merge_worktree(&wt_dir, repo.to_str().unwrap(), slug, "main")
+            .await
+            .expect("merge");
+        match outcome {
+            MergeOutcome::Success { commit_count, .. } => assert_eq!(commit_count, 1),
+            other => panic!("expected success, got {other:?}"),
+        }
+        // The commit landed on main in the original checkout and the worktree is gone.
+        assert!(repo.join("new.txt").exists());
+        assert!(!wt_dir.exists());
+        assert_eq!(git_out(&repo, &["log", "--oneline", "-1", "--format=%s"]), "add feature");
+    }
+
+    #[tokio::test]
+    async fn merge_reports_conflicts_and_leaves_rebase_in_progress() {
+        let tmp = tempdir();
+        let repo = setup_repo(&tmp);
+        let data_dir = tmp.join("data");
+
+        let slug = "conflicting";
+        let wt_dir = worktree_directory(&data_dir, repo.to_str().unwrap(), slug);
+        create_worktree(repo.to_str().unwrap(), &wt_dir, slug, None)
+            .await
+            .expect("create worktree");
+
+        // Divergent edits to the same line on both sides.
+        std::fs::write(wt_dir.join("file.txt"), "worktree version\n").unwrap();
+        run_git(&wt_dir, &["commit", "-am", "worktree edit"]);
+        std::fs::write(repo.join("file.txt"), "main version\n").unwrap();
+        run_git(&repo, &["commit", "-am", "main edit"]);
+
+        let outcome = merge_worktree(&wt_dir, repo.to_str().unwrap(), slug, "main")
+            .await
+            .expect("merge call");
+        match outcome {
+            MergeOutcome::RebaseConflict { target_branch } => assert_eq!(target_branch, "main"),
+            other => panic!("expected rebase conflict, got {other:?}"),
+        }
+        // A second call while the rebase is unresolved reports the same state.
+        let again = merge_worktree(&wt_dir, repo.to_str().unwrap(), slug, "main")
+            .await
+            .expect("merge call");
+        assert!(matches!(again, MergeOutcome::RebaseConflict { .. }));
+    }
+
+    #[tokio::test]
+    async fn merge_refuses_dirty_worktree() {
+        let tmp = tempdir();
+        let repo = setup_repo(&tmp);
+        let data_dir = tmp.join("data");
+
+        let slug = "dirty";
+        let wt_dir = worktree_directory(&data_dir, repo.to_str().unwrap(), slug);
+        create_worktree(repo.to_str().unwrap(), &wt_dir, slug, None)
+            .await
+            .expect("create worktree");
+        std::fs::write(wt_dir.join("file.txt"), "uncommitted\n").unwrap();
+
+        let outcome = merge_worktree(&wt_dir, repo.to_str().unwrap(), slug, "main")
+            .await
+            .expect("merge call");
+        assert!(matches!(outcome, MergeOutcome::DirtyWorktree));
     }
 }

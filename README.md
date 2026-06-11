@@ -142,18 +142,30 @@ the bot's next scheduler tick (~5s). The scheduler recovers tasks stranded in
 
 ## Architecture
 
+The crate is layered domain-driven-design style. Dependencies point inward:
+`domain` depends on nothing, `application` orchestrates domain rules over
+connectors, `cli` wires it all together.
+
 ```
 src/
-  main.rs       CLI: run / project / send / task
-  discord.rs    gateway events, thread creation, slash commands
-  runner.rs     per-thread runtime: queue, interrupt, dispatch loop
-  opencode.rs   OpenCode HTTP client + global SSE event listener
-  scheduler.rs  scheduled-task polling loop (5s tick, atomic claim)
-  worktree.rs   git worktree create / rebase-merge / list
-  suffix.rs     `. queue` / `. btw` suffix detection
-  format.rs     2000-char markdown chunking, part rendering
-  db.rs         SQLite: projects, sessions, worktrees, tasks
-  config.rs     environment configuration
+  main.rs                        thin entry point
+  cli/
+    mod.rs                       clap commands: run / project / send / task
+  domain/                        pure business rules, no I/O
+    delivery.rs                  `. queue` / `. btw` suffix semantics
+    rendering.rs                 2000-char markdown chunking, part rendering
+    session.rs                   queued messages, assistant-turn parts
+    task.rs                      schedule parsing (ISO/cron), task entities
+    worktree.rs                  naming rules, layout, merge outcomes
+  application/                   use cases
+    config.rs                    environment configuration
+    session_runtime.rs           per-thread runtime: queue, interrupt, dispatch
+    task_runner.rs               scheduled-task polling loop (5s tick, atomic claim)
+  connector/                     adapters to the outside world
+    discord.rs                   gateway events, thread creation, slash commands
+    opencode.rs                  OpenCode HTTP client + global SSE event listener
+    sqlite.rs                    persistence: projects, sessions, worktrees, tasks
+    git.rs                       worktree create / rebase-merge / list
 ```
 
 State lives in SQLite at `~/.lily/lily.db`. The message queue is in-memory

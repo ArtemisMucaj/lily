@@ -4,7 +4,7 @@
 //! boundaries; an open code fence is closed at the end of a chunk and
 //! reopened at the start of the next so fences stay balanced.
 
-use crate::opencode::Part;
+use crate::domain::session::Part;
 use serde_json::Value;
 
 pub const DISCORD_MESSAGE_LIMIT: usize = 2000;

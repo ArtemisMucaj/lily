@@ -11,6 +11,7 @@
 //! Requests are scoped to a project directory with the `x-opencode-directory`
 //! header, mirroring how the kimaki CLI drives the same server.
 
+use crate::domain::session::Part;
 use anyhow::{anyhow, Context as _, Result};
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -37,15 +38,6 @@ pub struct Event {
 #[derive(Debug, Deserialize)]
 pub struct Session {
     pub id: String,
-}
-
-/// One part of an assistant turn, as returned by `POST /session/:id/message`
-/// and carried in `message.part.updated` events.
-#[derive(Debug, Clone)]
-pub struct Part {
-    pub id: String,
-    pub kind: String,
-    pub payload: Value,
 }
 
 #[derive(Debug)]
