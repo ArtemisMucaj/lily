@@ -3,7 +3,8 @@
 use crate::application::config::Config;
 use crate::application::{session_runtime, task_runner};
 use crate::connector::sqlite::Db;
-use crate::connector::{discord, opencode};
+use crate::application::chat::ChatConnector;
+use crate::connector::{discord, matrix, opencode, router};
 use crate::domain::rendering;
 use crate::domain::task::{
     build_task, describe_task, parse_send_at, ParsedSendAt, TaskPayload, PROMPT_MAX_LEN,
@@ -111,10 +112,13 @@ pub async fn run() -> Result<()> {
 }
 
 async fn run_bot(config: Config, db: Arc<Db>) -> Result<()> {
-    let token = config
-        .discord_token
-        .clone()
-        .ok_or_else(|| anyhow!("DISCORD_TOKEN is not set"))?;
+    let discord_enabled = config.discord_token.is_some();
+    let matrix_enabled = config.matrix_homeserver.is_some();
+    if !discord_enabled && !matrix_enabled {
+        return Err(anyhow!(
+            "no connector configured: set DISCORD_TOKEN and/or MATRIX_HOMESERVER (+ MATRIX_USER, MATRIX_PASSWORD)"
+        ));
+    }
     let oc = opencode::OpencodeClient::new(&config.opencode_url);
     tracing::info!("using OpenCode server at {}", config.opencode_url);
     let state = Arc::new(session_runtime::AppState::new(db, oc.clone(), config));
@@ -125,20 +129,48 @@ async fn run_bot(config: Config, db: Arc<Db>) -> Result<()> {
         tokio::spawn(async move { oc.run_event_listener("/").await });
     }
 
-    let intents = serenity::all::GatewayIntents::GUILDS
-        | serenity::all::GatewayIntents::GUILD_MESSAGES
-        | serenity::all::GatewayIntents::MESSAGE_CONTENT;
-    let mut client = serenity::Client::builder(&token, intents)
-        .event_handler(discord::Handler { state: state.clone() })
-        .await
-        .context("failed to build Discord client")?;
+    let mut discord_client = if discord_enabled {
+        let token = state.config.discord_token.clone().unwrap();
+        let intents = serenity::all::GatewayIntents::GUILDS
+            | serenity::all::GatewayIntents::GUILD_MESSAGES
+            | serenity::all::GatewayIntents::MESSAGE_CONTENT;
+        Some(
+            serenity::Client::builder(&token, intents)
+                .event_handler(discord::Handler { state: state.clone() })
+                .await
+                .context("failed to build Discord client")?,
+        )
+    } else {
+        None
+    };
+    let matrix_client = if matrix_enabled {
+        Some(matrix::build_client(&state).await?)
+    } else {
+        None
+    };
 
-    // Scheduled-task loop shares the same HTTP client as the gateway.
-    let chat: std::sync::Arc<dyn crate::application::chat::ChatConnector> =
-        std::sync::Arc::new(discord::DiscordChat { http: client.http.clone() });
-    tokio::spawn(task_runner::run_task_loop(state, chat));
+    // Scheduled tasks address either platform; route by id shape.
+    let chat: Arc<dyn ChatConnector> = Arc::new(router::RoutedChat {
+        discord: discord_client
+            .as_ref()
+            .map(|c| Arc::new(discord::DiscordChat { http: c.http.clone() }) as Arc<dyn ChatConnector>),
+        matrix: matrix_client
+            .clone()
+            .map(|c| Arc::new(matrix::MatrixChat { client: c }) as Arc<dyn ChatConnector>),
+    });
+    tokio::spawn(task_runner::run_task_loop(state.clone(), chat));
 
-    client.start().await.context("Discord client error")?;
+    match (discord_client.as_mut(), matrix_client) {
+        (Some(discord), Some(matrix)) => {
+            tokio::select! {
+                r = discord.start() => r.context("Discord client error")?,
+                r = matrix::run(state, matrix) => r?,
+            }
+        }
+        (Some(discord), None) => discord.start().await.context("Discord client error")?,
+        (None, Some(matrix)) => matrix::run(state, matrix).await?,
+        (None, None) => unreachable!(),
+    }
     Ok(())
 }
 
@@ -177,13 +209,19 @@ fn run_send(
     user: Option<String>,
 ) -> Result<()> {
     let payload = match (&channel, &thread) {
-        (Some(c), None) => TaskPayload::Channel {
-            channel_id: c.clone(),
-            prompt: prompt.clone(),
-            name,
-            notify_only,
-            user_id: user,
-        },
+        (Some(c), None) => {
+            // Fail fast: the task runner would hard-fail on this later.
+            if db.get_channel_directory(c)?.is_none() {
+                return Err(anyhow!("channel {c} is not linked to a project"));
+            }
+            TaskPayload::Channel {
+                channel_id: c.clone(),
+                prompt: prompt.clone(),
+                name,
+                notify_only,
+                user_id: user,
+            }
+        }
         (None, Some(t)) => {
             if notify_only {
                 return Err(anyhow!("--notify-only only applies to channel sends"));

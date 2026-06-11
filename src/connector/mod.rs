@@ -5,5 +5,7 @@
 
 pub mod discord;
 pub mod git;
+pub mod matrix;
 pub mod opencode;
+pub mod router;
 pub mod sqlite;

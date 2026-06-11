@@ -14,9 +14,17 @@ pub struct Config {
     /// How long a message waits behind a running step before lily aborts the
     /// step and force-delivers it (`LILY_INTERRUPT_STEP_TIMEOUT_MS`).
     pub interrupt_timeout_ms: u64,
-    /// Discord user ids allowed to drive the bot (`LILY_ALLOWED_USERS`,
-    /// comma-separated). Empty means every guild member is allowed.
-    pub allowed_users: Vec<u64>,
+    /// User ids allowed to drive the bot (`LILY_ALLOWED_USERS`,
+    /// comma-separated): Discord snowflakes and/or Matrix MXIDs
+    /// (`@user:server`). Empty means every member is allowed.
+    pub allowed_users: Vec<String>,
+    /// Matrix homeserver URL (`MATRIX_HOMESERVER`); enables the Matrix
+    /// connector when set together with the credentials below.
+    pub matrix_homeserver: Option<String>,
+    /// Matrix user id or localpart (`MATRIX_USER`).
+    pub matrix_user: Option<String>,
+    /// Matrix account password (`MATRIX_PASSWORD`).
+    pub matrix_password: Option<String>,
 }
 
 impl Config {
@@ -41,15 +49,24 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3000),
             allowed_users: std::env::var("LILY_ALLOWED_USERS")
-                .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
+                .map(|v| {
+                    v.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
                 .unwrap_or_default(),
+            matrix_homeserver: std::env::var("MATRIX_HOMESERVER").ok(),
+            matrix_user: std::env::var("MATRIX_USER").ok(),
+            matrix_password: std::env::var("MATRIX_PASSWORD").ok(),
         })
     }
 
     /// True when `user_id` may drive the bot. An empty allowlist permits
     /// everyone (single-user/private-server setups).
-    pub fn is_user_allowed(&self, user_id: u64) -> bool {
-        self.allowed_users.is_empty() || self.allowed_users.contains(&user_id)
+    pub fn is_user_allowed(&self, user_id: &str) -> bool {
+        self.allowed_users.is_empty() || self.allowed_users.iter().any(|u| u == user_id)
     }
 
     pub fn db_path(&self) -> PathBuf {

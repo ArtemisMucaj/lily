@@ -99,6 +99,13 @@ pub async fn merge_worktree(
     let main_repo = Path::new(main_repo_dir);
     let branch = branch_name(slug);
 
+    // The target branch reaches several git invocations (rebase, rev-parse,
+    // push refspec); validate it so a crafted value can't be parsed as a git
+    // option (e.g. `--exec`).
+    git_ok(worktree_dir, &["check-ref-format", "--branch", target_branch])
+        .await
+        .map_err(|_| anyhow!("invalid target branch: {target_branch}"))?;
+
     // A rebase already in progress means the agent is (or should be) resolving
     // conflicts; report that instead of stacking another rebase.
     if rebase_in_progress(worktree_dir).await? {
@@ -172,20 +179,48 @@ pub async fn merge_worktree(
     let short_sha = git_ok(worktree_dir, &["rev-parse", "--short", "HEAD"]).await?;
 
     // Clean up: detach so the branch can be deleted, drop branch and worktree.
-    let _ = git(worktree_dir, &["checkout", "--detach", target_branch]).await;
-    let _ = git(main_repo, &["branch", "-D", &branch]).await;
+    // The merge itself already landed; failures here are surfaced as a
+    // warning rather than silently swallowed or reported as a merge failure.
+    let mut cleanup_failures: Vec<String> = Vec::new();
+    let mut check = |label: &str, out: Result<Output>| match out {
+        Ok(out) if out.status.success() => true,
+        Ok(out) => {
+            cleanup_failures
+                .push(format!("{label}: {}", String::from_utf8_lossy(&out.stderr).trim()));
+            false
+        }
+        Err(err) => {
+            cleanup_failures.push(format!("{label}: {err:#}"));
+            false
+        }
+    };
+    check("detach worktree HEAD", git(worktree_dir, &["checkout", "--detach", target_branch]).await);
+    check("delete branch", git(main_repo, &["branch", "-D", &branch]).await);
     let dir_str = worktree_dir.to_string_lossy().to_string();
-    let removed = git(main_repo, &["worktree", "remove", &dir_str]).await?;
-    if !removed.status.success() {
-        let _ = git(main_repo, &["worktree", "remove", "--force", &dir_str]).await;
+    let removed = matches!(
+        git(main_repo, &["worktree", "remove", &dir_str]).await,
+        Ok(out) if out.status.success()
+    );
+    if !removed {
+        // A plain remove can fail on leftover untracked files; force it and
+        // only report when even that fails.
+        check(
+            "remove worktree",
+            git(main_repo, &["worktree", "remove", "--force", &dir_str]).await,
+        );
     }
-    let _ = git(main_repo, &["worktree", "prune"]).await;
+    check("prune worktrees", git(main_repo, &["worktree", "prune"]).await);
 
     Ok(MergeOutcome::Success {
         target_branch: target_branch.to_string(),
         branch_name: branch,
         commit_count: count,
         short_sha,
+        cleanup_warning: if cleanup_failures.is_empty() {
+            None
+        } else {
+            Some(cleanup_failures.join("; "))
+        },
     })
 }
 

@@ -28,6 +28,9 @@ pub enum MergeOutcome {
         branch_name: String,
         commit_count: u64,
         short_sha: String,
+        /// Set when the merge landed but post-merge cleanup (branch delete,
+        /// worktree removal) partially failed and may need manual attention.
+        cleanup_warning: Option<String>,
     },
     /// Rebase stopped on conflicts; git is left mid-rebase so the agent can
     /// resolve them, after which /merge-worktree is run again.

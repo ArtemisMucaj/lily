@@ -30,6 +30,12 @@ pub trait ChatConnector: Send + Sync {
     /// Invite/add a user to a thread. Best-effort; failures are non-fatal.
     async fn add_thread_member(&self, thread_id: &str, user_id: &str) -> Result<()>;
 
+    /// Rename a thread, on platforms where threads have names. The default
+    /// is a no-op (Matrix threads, for example, are unnamed).
+    async fn rename_thread(&self, _thread_id: &str, _name: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// Show a short-lived typing indicator in a thread.
     async fn start_typing(&self, thread_id: &str);
 

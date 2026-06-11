@@ -45,7 +45,23 @@ cargo run --release -- run
 Configuration is environment-based: `DISCORD_TOKEN`, `OPENCODE_URL`
 (default `http://127.0.0.1:4096`), `LILY_DATA_DIR` (default `~/.lily`),
 `LILY_INTERRUPT_STEP_TIMEOUT_MS` (default `3000`), and `LILY_ALLOWED_USERS`
-(comma-separated Discord user ids; when set, everyone else is ignored).
+(comma-separated Discord ids and/or Matrix MXIDs; when set, everyone else is
+ignored).
+
+### Matrix
+
+lily also speaks Matrix — rooms are projects, Matrix threads are sessions.
+Set `MATRIX_HOMESERVER`, `MATRIX_USER`, and `MATRIX_PASSWORD` and run
+`lily run`; Discord and Matrix can run side by side in one process (set both
+sets of variables). The login session persists in `~/.lily/matrix-session.json`
+and the bot auto-joins rooms it is invited to.
+
+Matrix has no slash commands, so commands are text: `!add-project <dir>`,
+`!queue <msg>`, `!clear-queue [n]`, `!btw <prompt>`, `!new-worktree [name]
+[base]`, `!merge-worktree [target]`, `!worktrees`, `!tasks`, `!cancel-task
+<id>`, `!help`. The `. queue` / `. btw` suffixes, queued-message editing
+(`m.replace`), and agent output as `m.notice` all work the same as on Discord.
+For scheduled tasks, `lily send --channel '!room:server'` targets a room.
 
 **Authorization:** the bot runs agents on the host machine, so lock it down.
 Sensitive commands (`/add-project`, `/new-worktree`, `/merge-worktree`,
@@ -170,11 +186,14 @@ src/
     worktree.rs                  naming rules, layout, merge outcomes
   application/                   use cases
     chat.rs                      the chat port: what lily needs from a platform
+    commands.rs                  platform-neutral command flows (btw, worktrees, tasks)
     config.rs                    environment configuration
     session_runtime.rs           per-thread runtime: queue, interrupt, dispatch
     task_runner.rs               scheduled-task polling loop (5s tick, atomic claim)
   connector/                     adapters to the outside world
     discord.rs                   ChatConnector impl (serenity) + gateway events, slash commands
+    matrix.rs                    ChatConnector impl (matrix-sdk) + sync loop, !text commands
+    router.rs                    routes port calls by id shape when both run
     opencode.rs                  OpenCode HTTP client + global SSE event listener
     sqlite.rs                    persistence: projects, sessions, worktrees, tasks
     git.rs                       worktree create / rebase-merge / list

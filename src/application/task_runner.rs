@@ -36,6 +36,13 @@ async fn tick(state: &Arc<AppState>, chat: &Arc<dyn ChatConnector>) -> Result<()
         if !state.db.claim_task_running(task.id, Utc::now())? {
             continue;
         }
+        // Cancellation of a claimed task is cooperative: re-check right before
+        // the side effects so a `task delete` landing after the claim usually
+        // wins. (A cancel arriving mid-execution stays best-effort.)
+        if state.db.get_task_status(task.id)?.as_deref() != Some("running") {
+            tracing::info!("task {} was cancelled after claim; skipping", task.id);
+            continue;
+        }
         let outcome = execute_task(state, chat, &task).await;
         finalize_task(state, &task, outcome)?;
     }
@@ -57,7 +64,9 @@ async fn execute_task(
                 &format!("{}**lily-cli:**\n{}", rendering::QUEUE_PREFIX, prompt),
             )
             .await?;
-            let rt = session_runtime::get_or_create_runtime(state, &thread_id, directory).await;
+            let rt = session_runtime::get_or_create_runtime(state, &thread_id, directory).await?;
+            // Scheduled sends into a live thread wait politely (queue
+            // semantics) rather than interrupting whatever is running.
             session_runtime::enqueue_incoming(
                 state.clone(),
                 chat.clone(),
@@ -68,7 +77,7 @@ async fn execute_task(
                     source_message_id: None,
                     show_marker: false,
                 },
-                false,
+                true,
             )
             .await;
         }
@@ -90,7 +99,8 @@ async fn execute_task(
                 let _ = chat.add_thread_member(&thread_id, &uid).await;
             }
             if !notify_only {
-                let rt = session_runtime::get_or_create_runtime(state, &thread_id, directory).await;
+                let rt =
+                    session_runtime::get_or_create_runtime(state, &thread_id, directory).await?;
                 session_runtime::enqueue_incoming(
                     state.clone(),
                     chat.clone(),

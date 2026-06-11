@@ -418,6 +418,17 @@ impl Db {
         })
     }
 
+    pub fn get_task_status(&self, task_id: i64) -> Result<Option<String>> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT status FROM scheduled_tasks WHERE id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+    }
+
     pub fn cancel_task(&self, task_id: i64) -> Result<bool> {
         self.with(|c| {
             let n = c.execute(

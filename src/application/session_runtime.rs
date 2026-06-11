@@ -59,7 +59,7 @@ pub async fn get_or_create_runtime(
     state: &Arc<AppState>,
     thread_id: &str,
     directory: String,
-) -> Arc<ThreadRuntime> {
+) -> Result<Arc<ThreadRuntime>> {
     let mut map = state.runtimes.lock().await;
     if let Some(rt) = map.get(thread_id) {
         let rt = rt.clone();
@@ -70,23 +70,25 @@ pub async fn get_or_create_runtime(
             s.directory = directory;
         }
         drop(s);
-        return rt;
+        return Ok(rt);
     }
-    let session_id = state.db.get_thread_session(thread_id).ok().flatten();
+    // A storage failure must not look like "no session": that would silently
+    // start a fresh session and overwrite the thread's context binding.
+    let session_id = state.db.get_thread_session(thread_id)?;
     let rt = Arc::new(ThreadRuntime {
         thread_id: thread_id.to_string(),
         state: Mutex::new(RuntimeState { directory, session_id, ..Default::default() }),
     });
     map.insert(thread_id.to_string(), rt.clone());
-    rt
+    Ok(rt)
 }
 
 /// Drop the session binding so the next message starts a fresh session (used
 /// after a merge removes the worktree directory the session lived in).
 pub async fn reset_session(state: &AppState, rt: &ThreadRuntime) -> Result<()> {
-    let mut s = rt.state.lock().await;
-    s.session_id = None;
+    // Persist first; memory only changes once storage agrees.
     state.db.delete_thread_session(&rt.thread_id)?;
+    rt.state.lock().await.session_id = None;
     Ok(())
 }
 
@@ -187,18 +189,25 @@ async fn dispatch_loop(
 
 /// Returns the session id and the directory it is bound to, creating the
 /// session on first use.
+///
+/// The runtime lock is not held across the (potentially slow) OpenCode call,
+/// so queue edits and interrupt checks stay responsive, and the in-memory
+/// binding is only committed after it has been persisted. Only the dispatch
+/// loop calls this, one prompt at a time, so two creations cannot race.
 async fn ensure_session(state: &AppState, rt: &ThreadRuntime) -> Result<(String, String)> {
-    let mut s = rt.state.lock().await;
-    let directory = s.directory.clone();
-    if let Some(id) = &s.session_id {
-        return Ok((id.clone(), directory));
+    let (existing, directory) = {
+        let s = rt.state.lock().await;
+        (s.session_id.clone(), s.directory.clone())
+    };
+    if let Some(id) = existing {
+        return Ok((id, directory));
     }
     let session = state
         .oc
         .create_session(&directory, &format!("chat thread {}", rt.thread_id))
         .await?;
-    s.session_id = Some(session.id.clone());
     state.db.set_thread_session(&rt.thread_id, &session.id)?;
+    rt.state.lock().await.session_id = Some(session.id.clone());
     Ok((session.id, directory))
 }
 
@@ -333,6 +342,25 @@ pub async fn update_queue_item_for_edit(
     }
 }
 
+/// Apply a message edit when the platform doesn't say which thread it
+/// belongs to (Matrix `m.replace` events): scan every live runtime for the
+/// queued entry. Returns the owning thread id and the outcome.
+pub async fn update_queue_item_in_any(
+    state: &Arc<AppState>,
+    source_message_id: &str,
+    new_content: &str,
+) -> Option<(String, QueueEditOutcome)> {
+    let runtimes: Vec<Arc<ThreadRuntime>> =
+        state.runtimes.lock().await.values().cloned().collect();
+    for rt in runtimes {
+        let outcome = update_queue_item_for_edit(&rt, source_message_id, new_content).await;
+        if outcome != QueueEditOutcome::NotFound {
+            return Some((rt.thread_id.clone(), outcome));
+        }
+    }
+    None
+}
+
 /// Clear the whole queue (None) or one 1-based position. Returns the number
 /// of removed entries, or an error for a bad position.
 pub async fn clear_queue(rt: &ThreadRuntime, position: Option<usize>) -> Result<usize> {
@@ -355,9 +383,9 @@ pub async fn clear_queue(rt: &ThreadRuntime, position: Option<usize>) -> Result<
 
 /// Replace the runtime's session id (used after forking into a worktree).
 pub async fn set_session_id(state: &AppState, rt: &ThreadRuntime, session_id: &str) -> Result<()> {
-    let mut s = rt.state.lock().await;
-    s.session_id = Some(session_id.to_string());
+    // Persist first; memory only changes once storage agrees.
     state.db.set_thread_session(&rt.thread_id, session_id)?;
+    rt.state.lock().await.session_id = Some(session_id.to_string());
     Ok(())
 }
 
