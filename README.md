@@ -4,10 +4,8 @@ A collaborative agent orchestrator inside your chat, written in Rust. lily
 connects Discord and Matrix to a local [OpenCode](https://opencode.ai) server
 so you can drive coding agents from a conversation.
 
-- **Channels are projects.** Each channel (or Matrix room) is linked to a
-  project directory on the machine running lily.
-- **Threads are sessions.** Every message you send in a project channel starts
-  a thread bound to one OpenCode session. Messages in the thread continue it.
+- Each channel/room is linked to a project directory on the machine running lily.
+- Every message you send in a project channel starts a thread bound to one OpenCode session. Messages in the thread continue it.
 
 ```mermaid
 flowchart LR
@@ -30,6 +28,8 @@ flowchart LR
 
 ## Setup
 
+### Discord
+
 1. Create a Discord bot at [discord.com/developers](https://discord.com/developers/applications),
    enable the **Message Content** intent, and invite it to your server with the
    `bot` and `applications.commands` scopes (send messages, create threads,
@@ -44,30 +44,29 @@ cargo run --release -- run
 ```
 
 4. In a Discord channel, run `/add-project directory:/code/web-app`
-   (or from the CLI: `lily project add /code/web-app --channel <channel-id>`).
+   From the CLI: `lily project add /code/web-app --channel <channel-id>`
 5. Send a message in the channel. lily creates a thread, starts a session in
    the project directory, and the agent replies in the thread (`⬥` for prose,
    `┣` for tool activity, a `-# lily ⋅ 2m 30s` footer per turn).
 
-Configuration is environment-based: `DISCORD_TOKEN`, `OPENCODE_URL`
+Configuration is environment-based:`DISCORD_TOKEN`, `OPENCODE_URL`
 (default `http://127.0.0.1:4096`), `LILY_DATA_DIR` (default `~/.lily`),
 `LILY_INTERRUPT_STEP_TIMEOUT_MS` (default `3000`), and `LILY_ALLOWED_USERS`
 (comma-separated Discord ids and/or Matrix MXIDs; when set, everyone else is
 ignored).
 
-**Authorization:** the bot runs agents on the host machine, so lock it down.
-Sensitive commands (`/add-project`, `/worktree`, `/delete-task`) default to
-members with **Manage Guild**; adjust per command in Server Settings →
-Integrations. For private setups, set `LILY_ALLOWED_USERS` to your own user id
-so no one else can start sessions at all.
+The bot runs agents on the host machine, so lock it down. Sensitive commands (`/add-project`, `/worktree`, `/delete-task`) default to
+members with **manage guild**.
+
+Adjust per command in server settings. For private setups, set `LILY_ALLOWED_USERS` to your own user id so no one else can start sessions at all.
 
 ### Matrix
 
 lily also speaks Matrix — rooms are projects, Matrix threads are sessions.
 Set `MATRIX_HOMESERVER`, `MATRIX_USER`, and `MATRIX_PASSWORD` and run
-`lily run`; Discord and Matrix can run side by side in one process (set both
-sets of variables). The login session persists in `~/.lily/matrix-session.json`
-and the bot auto-joins rooms it is invited to.
+`lily run`;
+
+The login session persists in `~/.lily/matrix-session.json` and the bot auto-joins rooms it is invited to.
 
 Matrix has no slash commands, so commands are text: `!add-project <dir>`,
 `!queue <msg>`, `!clear [n]`, `!btw <prompt>`, `!worktree [name] [base]`,
