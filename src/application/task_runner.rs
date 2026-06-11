@@ -1,13 +1,13 @@
 //! Scheduled-task runner: a polling loop that claims due tasks, posts them
-//! into Discord, starts agent sessions, and reschedules cron tasks.
+//! into the chat platform, starts agent sessions, and reschedules cron tasks.
 
+use crate::application::chat::ChatConnector;
 use crate::application::session_runtime::{self, AppState};
 use crate::domain::rendering;
 use crate::domain::session::QueuedMessage;
 use crate::domain::task::{next_cron_run, ScheduledTask, TaskPayload};
 use anyhow::{anyhow, Context as _, Result};
 use chrono::Utc;
-use serenity::all::{AutoArchiveDuration, ChannelId, CreateMessage, CreateThread, Http, UserId};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,16 +16,16 @@ pub const STALE_RUNNING: chrono::Duration = chrono::Duration::minutes(2);
 pub const DUE_BATCH_SIZE: usize = 20;
 
 /// The polling loop. Spawned once by `lily run`.
-pub async fn run_task_loop(state: Arc<AppState>, http: Arc<Http>) {
+pub async fn run_task_loop(state: Arc<AppState>, chat: Arc<dyn ChatConnector>) {
     loop {
-        if let Err(err) = tick(&state, &http).await {
+        if let Err(err) = tick(&state, &chat).await {
             tracing::warn!("task scheduler tick failed: {err:#}");
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
-async fn tick(state: &Arc<AppState>, http: &Arc<Http>) -> Result<()> {
+async fn tick(state: &Arc<AppState>, chat: &Arc<dyn ChatConnector>) -> Result<()> {
     let now = Utc::now();
     let recovered = state.db.recover_stale_running_tasks(now - STALE_RUNNING)?;
     if recovered > 0 {
@@ -36,30 +36,31 @@ async fn tick(state: &Arc<AppState>, http: &Arc<Http>) -> Result<()> {
         if !state.db.claim_task_running(task.id, Utc::now())? {
             continue;
         }
-        let outcome = execute_task(state, http, &task).await;
+        let outcome = execute_task(state, chat, &task).await;
         finalize_task(state, &task, outcome)?;
     }
     Ok(())
 }
 
-async fn execute_task(state: &Arc<AppState>, http: &Arc<Http>, task: &ScheduledTask) -> Result<()> {
+async fn execute_task(
+    state: &Arc<AppState>,
+    chat: &Arc<dyn ChatConnector>,
+    task: &ScheduledTask,
+) -> Result<()> {
     let payload: TaskPayload =
         serde_json::from_str(&task.payload_json).context("bad task payload json")?;
     match payload {
         TaskPayload::Thread { thread_id, prompt, .. } => {
-            let thread: ChannelId = thread_id.parse().context("bad thread id in task")?;
-            let directory = resolve_thread_directory(state, http, thread).await?;
-            thread
-                .send_message(
-                    http,
-                    CreateMessage::new()
-                        .content(format!("{}**lily-cli:**\n{}", rendering::QUEUE_PREFIX, prompt)),
-                )
-                .await?;
-            let rt = session_runtime::get_or_create_runtime(state, thread, directory).await;
+            let directory = resolve_thread_directory(state, chat.as_ref(), &thread_id).await?;
+            chat.post_message(
+                &thread_id,
+                &format!("{}**lily-cli:**\n{}", rendering::QUEUE_PREFIX, prompt),
+            )
+            .await?;
+            let rt = session_runtime::get_or_create_runtime(state, &thread_id, directory).await;
             session_runtime::enqueue_incoming(
                 state.clone(),
-                http.clone(),
+                chat.clone(),
                 rt,
                 QueuedMessage {
                     prompt,
@@ -72,33 +73,27 @@ async fn execute_task(state: &Arc<AppState>, http: &Arc<Http>, task: &ScheduledT
             .await;
         }
         TaskPayload::Channel { channel_id, prompt, name, notify_only, user_id } => {
-            let channel: ChannelId = channel_id.parse().context("bad channel id in task")?;
             let directory = state
                 .db
                 .get_channel_directory(&channel_id)?
                 .ok_or_else(|| anyhow!("channel {channel_id} is not linked to a project"))?;
-            let starter = channel
-                .send_message(http, CreateMessage::new().content(prompt.clone()))
+            let starter = chat
+                .post_message(&channel_id, &prompt)
                 .await
                 .context("failed to post task starter message")?;
             let thread_name = name.unwrap_or_else(|| rendering::prompt_preview(&prompt, 100));
-            let thread = channel
-                .create_thread_from_message(
-                    http,
-                    starter.id,
-                    CreateThread::new(truncate(&thread_name, 100))
-                        .auto_archive_duration(AutoArchiveDuration::OneDay),
-                )
+            let thread_id = chat
+                .create_thread(&channel_id, Some(&starter), &thread_name)
                 .await
                 .context("failed to create task thread")?;
-            if let Some(uid) = user_id.and_then(|u| u.parse::<u64>().ok()) {
-                let _ = thread.id.add_thread_member(http, UserId::new(uid)).await;
+            if let Some(uid) = user_id {
+                let _ = chat.add_thread_member(&thread_id, &uid).await;
             }
             if !notify_only {
-                let rt = session_runtime::get_or_create_runtime(state, thread.id, directory).await;
+                let rt = session_runtime::get_or_create_runtime(state, &thread_id, directory).await;
                 session_runtime::enqueue_incoming(
                     state.clone(),
-                    http.clone(),
+                    chat.clone(),
                     rt,
                     QueuedMessage {
                         prompt,
@@ -148,10 +143,10 @@ fn finalize_task(state: &Arc<AppState>, task: &ScheduledTask, outcome: Result<()
 /// ready, otherwise the parent channel's project directory.
 pub async fn resolve_thread_directory(
     state: &Arc<AppState>,
-    http: &Arc<Http>,
-    thread_id: ChannelId,
+    chat: &dyn ChatConnector,
+    thread_id: &str,
 ) -> Result<String> {
-    if let Some(wt) = state.db.get_thread_worktree(&thread_id.to_string())? {
+    if let Some(wt) = state.db.get_thread_worktree(thread_id)? {
         // Never fall back to the project directory while a worktree is
         // assigned: running there would break the isolation the worktree
         // exists to provide.
@@ -174,21 +169,13 @@ pub async fn resolve_thread_directory(
         }
     }
     // The thread's session directory comes from the parent channel mapping.
-    let channel = thread_id.to_channel(http).await.context("failed to fetch thread channel")?;
-    let guild_channel = channel.guild().ok_or_else(|| anyhow!("not a guild thread"))?;
-    let parent = guild_channel
-        .parent_id
+    let parent = chat
+        .thread_parent(thread_id)
+        .await
+        .context("failed to resolve thread parent")?
         .ok_or_else(|| anyhow!("thread {thread_id} has no parent channel"))?;
     state
         .db
-        .get_channel_directory(&parent.to_string())?
+        .get_channel_directory(&parent)?
         .ok_or_else(|| anyhow!("channel {parent} is not linked to a project (use /add-project)"))
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    let mut cut = s.len().min(max);
-    while !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    s[..cut].to_string()
 }

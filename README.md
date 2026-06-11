@@ -151,7 +151,11 @@ the bot's next scheduler tick (~5s). The scheduler recovers tasks stranded in
 
 The crate is layered domain-driven-design style. Dependencies point inward:
 `domain` depends on nothing, `application` orchestrates domain rules over
-connectors, `cli` wires it all together.
+connectors, `cli` wires it all together. The application layer talks to the
+chat platform only through the `ChatConnector` port (thread/message ids are
+opaque strings), so supporting another platform — e.g. Matrix via
+matrix-rust-sdk, where rooms map to projects and Matrix threads to sessions —
+means implementing one trait in a new connector.
 
 ```text
 src/
@@ -165,11 +169,12 @@ src/
     task.rs                      schedule parsing (ISO/cron), task entities
     worktree.rs                  naming rules, layout, merge outcomes
   application/                   use cases
+    chat.rs                      the chat port: what lily needs from a platform
     config.rs                    environment configuration
     session_runtime.rs           per-thread runtime: queue, interrupt, dispatch
     task_runner.rs               scheduled-task polling loop (5s tick, atomic claim)
   connector/                     adapters to the outside world
-    discord.rs                   gateway events, thread creation, slash commands
+    discord.rs                   ChatConnector impl (serenity) + gateway events, slash commands
     opencode.rs                  OpenCode HTTP client + global SSE event listener
     sqlite.rs                    persistence: projects, sessions, worktrees, tasks
     git.rs                       worktree create / rebase-merge / list

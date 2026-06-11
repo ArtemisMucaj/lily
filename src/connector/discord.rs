@@ -5,6 +5,7 @@
 //! - Slash commands implement project linking, the queue, btw forks, and
 //!   worktree management.
 
+use crate::application::chat::ChatConnector;
 use crate::application::session_runtime::{self as runner, AppState};
 use crate::application::task_runner;
 use crate::connector::git;
@@ -16,7 +17,8 @@ use crate::domain::worktree;
 use anyhow::{anyhow, Context as _, Result};
 use serenity::all::{
     AutoArchiveDuration, ChannelId, ChannelType, Command, CommandInteraction, CommandOptionType,
-    Context, CreateCommand, CreateCommandOption, CreateInteractionResponse,
+    Context, CreateCommand, CreateCommandOption, CreateInteractionResponse, CreateMessage,
+    MessageFlags,
     CreateInteractionResponseFollowup, CreateInteractionResponseMessage, CreateThread, EditChannel,
     EditThread, EventHandler, GuildChannel, Http, Interaction, Message, MessageId,
     MessageUpdateEvent, Permissions, Ready, ResolvedValue,
@@ -24,8 +26,93 @@ use serenity::all::{
 use serenity::async_trait;
 use std::sync::Arc;
 
+/// Serenity-backed implementation of the chat port. Holds the HTTP client;
+/// gateway events are handled separately by [`Handler`].
+pub struct DiscordChat {
+    pub http: Arc<Http>,
+}
+
+fn parse_id(id: &str) -> Result<u64> {
+    id.parse().with_context(|| format!("not a Discord id: {id}"))
+}
+
+#[serenity::async_trait]
+impl ChatConnector for DiscordChat {
+    async fn send_message(&self, thread_id: &str, content: &str) -> Result<()> {
+        let channel = ChannelId::new(parse_id(thread_id)?);
+        for chunk in rendering::split_markdown(content, rendering::DISCORD_MESSAGE_LIMIT) {
+            let msg = CreateMessage::new()
+                .content(chunk)
+                .flags(MessageFlags::SUPPRESS_NOTIFICATIONS);
+            channel.send_message(&self.http, msg).await?;
+        }
+        Ok(())
+    }
+
+    async fn post_message(&self, channel_id: &str, content: &str) -> Result<String> {
+        let channel = ChannelId::new(parse_id(channel_id)?);
+        // Posts also respect Discord's message limit.
+        let mut last_id = None;
+        for chunk in rendering::split_markdown(content, rendering::DISCORD_MESSAGE_LIMIT) {
+            let msg = channel.send_message(&self.http, CreateMessage::new().content(chunk)).await?;
+            last_id = Some(msg.id.to_string());
+        }
+        last_id.ok_or_else(|| anyhow!("empty message"))
+    }
+
+    async fn create_thread(
+        &self,
+        channel_id: &str,
+        from_message: Option<&str>,
+        name: &str,
+    ) -> Result<String> {
+        let channel = ChannelId::new(parse_id(channel_id)?);
+        let builder = CreateThread::new(truncate_name(name))
+            .auto_archive_duration(AutoArchiveDuration::OneDay);
+        let thread = match from_message {
+            Some(mid) => {
+                let message = serenity::all::MessageId::new(parse_id(mid)?);
+                channel.create_thread_from_message(&self.http, message, builder).await?
+            }
+            None => {
+                channel
+                    .create_thread(&self.http, builder.kind(ChannelType::PublicThread))
+                    .await?
+            }
+        };
+        Ok(thread.id.to_string())
+    }
+
+    async fn add_thread_member(&self, thread_id: &str, user_id: &str) -> Result<()> {
+        let thread = ChannelId::new(parse_id(thread_id)?);
+        let user = serenity::all::UserId::new(parse_id(user_id)?);
+        thread.add_thread_member(&self.http, user).await?;
+        Ok(())
+    }
+
+    async fn start_typing(&self, thread_id: &str) {
+        if let Ok(id) = parse_id(thread_id) {
+            let _ = ChannelId::new(id).broadcast_typing(&self.http).await;
+        }
+    }
+
+    async fn thread_parent(&self, thread_id: &str) -> Result<Option<String>> {
+        let channel = ChannelId::new(parse_id(thread_id)?)
+            .to_channel(&self.http)
+            .await
+            .context("failed to fetch thread channel")?;
+        Ok(channel.guild().and_then(|gc| gc.parent_id).map(|p| p.to_string()))
+    }
+}
+
 pub struct Handler {
     pub state: Arc<AppState>,
+}
+
+impl Handler {
+    fn chat(&self, ctx: &Context) -> Arc<dyn ChatConnector> {
+        Arc::new(DiscordChat { http: ctx.http.clone() })
+    }
 }
 
 #[async_trait]
@@ -270,16 +357,16 @@ impl Handler {
             .context("failed to create thread")?;
         let _ = thread.id.add_thread_member(&ctx.http, msg.author.id).await;
 
-        let rt = runner::get_or_create_runtime(&self.state, thread.id, directory).await;
+        let rt = runner::get_or_create_runtime(&self.state, &thread.id.to_string(), directory).await;
         // A fresh session is idle: queue/btw suffixes behave like a normal send.
         runner::enqueue_incoming(
             self.state.clone(),
-            ctx.http.clone(),
+            self.chat(ctx),
             rt,
             QueuedMessage {
                 prompt: parsed.prompt,
                 username: msg.author.name.clone(),
-                source_message_id: Some(msg.id),
+                source_message_id: Some(msg.id.to_string()),
                 show_marker: false,
             },
             false,
@@ -296,9 +383,9 @@ impl Handler {
         thread: &GuildChannel,
     ) -> Result<()> {
         let directory =
-            task_runner::resolve_thread_directory(&self.state, &ctx.http, msg.channel_id).await?;
+            task_runner::resolve_thread_directory(&self.state, &*self.chat(ctx), &msg.channel_id.to_string()).await?;
         let parsed = delivery::parse_message(&msg.content);
-        let rt = runner::get_or_create_runtime(&self.state, msg.channel_id, directory.clone()).await;
+        let rt = runner::get_or_create_runtime(&self.state, &msg.channel_id.to_string(), directory.clone()).await;
 
         match parsed.delivery {
             Delivery::Btw => {
@@ -319,12 +406,12 @@ impl Handler {
             Delivery::Queue => {
                 let result = runner::enqueue_incoming(
                     self.state.clone(),
-                    ctx.http.clone(),
+                    self.chat(ctx),
                     rt,
                     QueuedMessage {
                         prompt: parsed.prompt,
                         username: msg.author.name.clone(),
-                        source_message_id: Some(msg.id),
+                        source_message_id: Some(msg.id.to_string()),
                         show_marker: false,
                     },
                     true,
@@ -342,12 +429,12 @@ impl Handler {
             Delivery::Normal => {
                 runner::enqueue_incoming(
                     self.state.clone(),
-                    ctx.http.clone(),
+                    self.chat(ctx),
                     rt,
                     QueuedMessage {
                         prompt: parsed.prompt,
                         username: msg.author.name.clone(),
-                        source_message_id: Some(msg.id),
+                        source_message_id: Some(msg.id.to_string()),
                         show_marker: false,
                     },
                     false,
@@ -371,12 +458,12 @@ impl Handler {
             return Ok(());
         }
         let Ok(directory) =
-            task_runner::resolve_thread_directory(&self.state, &ctx.http, channel_id).await
+            task_runner::resolve_thread_directory(&self.state, &*self.chat(ctx), &channel_id.to_string()).await
         else {
             return Ok(());
         };
-        let rt = runner::get_or_create_runtime(&self.state, channel_id, directory).await;
-        match runner::update_queue_item_for_edit(&rt, message_id, new_content).await {
+        let rt = runner::get_or_create_runtime(&self.state, &channel_id.to_string(), directory).await;
+        match runner::update_queue_item_for_edit(&rt, &message_id.to_string(), new_content).await {
             QueueEditOutcome::Updated => {
                 channel_id
                     .say(&ctx.http, format!("⬦ **{username}** edited queued message"))
@@ -446,10 +533,10 @@ impl Handler {
              Do NOT continue, resume, or reference the previous task. Only answer the question below.\n\n{prompt}"
         );
         let rt =
-            runner::get_or_create_runtime(&self.state, thread.id, directory.to_string()).await;
+            runner::get_or_create_runtime(&self.state, &thread.id.to_string(), directory.to_string()).await;
         runner::enqueue_incoming(
             self.state.clone(),
-            ctx.http.clone(),
+            self.chat(ctx),
             rt,
             QueuedMessage {
                 prompt: wrapped,
@@ -512,8 +599,8 @@ impl Handler {
             return Err(anyhow!("this command only works inside a session thread"));
         }
         let directory =
-            task_runner::resolve_thread_directory(&self.state, &ctx.http, cmd.channel_id).await?;
-        Ok(runner::get_or_create_runtime(&self.state, cmd.channel_id, directory).await)
+            task_runner::resolve_thread_directory(&self.state, &*self.chat(ctx), &cmd.channel_id.to_string()).await?;
+        Ok(runner::get_or_create_runtime(&self.state, &cmd.channel_id.to_string(), directory).await)
     }
 
     async fn cmd_queue(&self, ctx: &Context, cmd: &CommandInteraction) -> Result<()> {
@@ -521,7 +608,7 @@ impl Handler {
         let rt = self.thread_runtime(ctx, cmd).await?;
         let result = runner::enqueue_incoming(
             self.state.clone(),
-            ctx.http.clone(),
+            self.chat(ctx),
             rt,
             QueuedMessage {
                 prompt: message,
@@ -556,7 +643,7 @@ impl Handler {
         }
         let parent = channel.parent_id.ok_or_else(|| anyhow!("thread has no parent channel"))?;
         let directory =
-            task_runner::resolve_thread_directory(&self.state, &ctx.http, cmd.channel_id).await?;
+            task_runner::resolve_thread_directory(&self.state, &*self.chat(ctx), &cmd.channel_id.to_string()).await?;
         defer(ctx, cmd).await?;
         let thread_id = self
             .fork_btw(ctx, cmd.channel_id, parent, &directory, &prompt, cmd.user.id.get(), &cmd.user.name)
@@ -648,7 +735,7 @@ impl Handler {
                     // worktree. If a session already exists, fork it into the
                     // worktree so the context carries over.
                     let old_session = state.db.get_thread_session(&thread_id.to_string()).ok().flatten();
-                    let rt = runner::get_or_create_runtime(&state, thread_id, dir_str.clone()).await;
+                    let rt = runner::get_or_create_runtime(&state, &thread_id.to_string(), dir_str.clone()).await;
                     if let Some(old) = old_session {
                         match state.oc.fork_session(&dir_str, &old).await {
                             Ok(forked) => {
@@ -723,7 +810,7 @@ impl Handler {
                 // bound to the removed directory.
                 let rt = runner::get_or_create_runtime(
                     &self.state,
-                    cmd.channel_id,
+                    &cmd.channel_id.to_string(),
                     wt.project_directory.clone(),
                 )
                 .await;
@@ -749,11 +836,11 @@ impl Handler {
                 )
                 .await?;
                 let directory =
-                    task_runner::resolve_thread_directory(&self.state, &ctx.http, cmd.channel_id).await?;
-                let rt = runner::get_or_create_runtime(&self.state, cmd.channel_id, directory).await;
+                    task_runner::resolve_thread_directory(&self.state, &*self.chat(ctx), &cmd.channel_id.to_string()).await?;
+                let rt = runner::get_or_create_runtime(&self.state, &cmd.channel_id.to_string(), directory).await;
                 runner::enqueue_incoming(
                     self.state.clone(),
-                    ctx.http.clone(),
+                    self.chat(ctx),
                     rt,
                     QueuedMessage {
                         prompt: worktree::conflict_resolution_prompt(&target_branch),

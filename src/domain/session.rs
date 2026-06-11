@@ -3,7 +3,6 @@
 //! `application::session_runtime`.
 
 use serde_json::Value;
-use serenity::all::MessageId;
 
 /// One part of an assistant turn (text, tool call, file, ...), produced by
 /// the agent backend and rendered into Discord by `domain::rendering`.
@@ -19,9 +18,9 @@ pub struct Part {
 pub struct QueuedMessage {
     pub prompt: String,
     pub username: String,
-    /// Discord message that produced this entry; used so editing the message
-    /// updates (or removes) the queued prompt.
-    pub source_message_id: Option<MessageId>,
+    /// Chat message that produced this entry (platform-specific id); used so
+    /// editing the message updates (or removes) the queued prompt.
+    pub source_message_id: Option<String>,
     /// Show the `»` dispatched-from-queue marker when this entry had to wait.
     pub show_marker: bool,
 }

@@ -1,10 +1,15 @@
 //! Per-thread session orchestration.
 //!
-//! Every Discord thread maps to one OpenCode session. A `ThreadRuntime` holds
+//! Every chat thread maps to one OpenCode session. A `ThreadRuntime` holds
 //! the session id, a busy flag, and the local message queue. Messages sent
 //! while a run is active either wait in the queue (`. queue`) or interrupt the
 //! run after a grace period (normal messages).
+//!
+//! This layer talks to the chat platform only through the
+//! [`ChatConnector`](crate::application::chat::ChatConnector) port; thread and
+//! message ids are opaque strings.
 
+use crate::application::chat::ChatConnector;
 use crate::application::config::Config;
 use crate::connector::opencode::OpencodeClient;
 use crate::connector::sqlite::Db;
@@ -12,7 +17,6 @@ use crate::domain::delivery::{self, Delivery};
 use crate::domain::rendering;
 use crate::domain::session::{EnqueueResult, QueueEditOutcome, QueuedMessage};
 use anyhow::{anyhow, Result};
-use serenity::all::{ChannelId, CreateMessage, Http, MessageFlags, MessageId};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,7 +26,7 @@ pub struct AppState {
     pub db: Arc<Db>,
     pub oc: OpencodeClient,
     pub config: Config,
-    runtimes: Mutex<HashMap<ChannelId, Arc<ThreadRuntime>>>,
+    runtimes: Mutex<HashMap<String, Arc<ThreadRuntime>>>,
 }
 
 impl AppState {
@@ -32,7 +36,7 @@ impl AppState {
 }
 
 pub struct ThreadRuntime {
-    pub thread_id: ChannelId,
+    pub thread_id: String,
     state: Mutex<RuntimeState>,
 }
 
@@ -53,11 +57,11 @@ struct RuntimeState {
 /// is retargeted in place so its dispatch loop and queue carry over.
 pub async fn get_or_create_runtime(
     state: &Arc<AppState>,
-    thread_id: ChannelId,
+    thread_id: &str,
     directory: String,
 ) -> Arc<ThreadRuntime> {
     let mut map = state.runtimes.lock().await;
-    if let Some(rt) = map.get(&thread_id) {
+    if let Some(rt) = map.get(thread_id) {
         let rt = rt.clone();
         drop(map);
         let mut s = rt.state.lock().await;
@@ -68,12 +72,12 @@ pub async fn get_or_create_runtime(
         drop(s);
         return rt;
     }
-    let session_id = state.db.get_thread_session(&thread_id.to_string()).ok().flatten();
+    let session_id = state.db.get_thread_session(thread_id).ok().flatten();
     let rt = Arc::new(ThreadRuntime {
-        thread_id,
+        thread_id: thread_id.to_string(),
         state: Mutex::new(RuntimeState { directory, session_id, ..Default::default() }),
     });
-    map.insert(thread_id, rt.clone());
+    map.insert(thread_id.to_string(), rt.clone());
     rt
 }
 
@@ -82,18 +86,13 @@ pub async fn get_or_create_runtime(
 pub async fn reset_session(state: &AppState, rt: &ThreadRuntime) -> Result<()> {
     let mut s = rt.state.lock().await;
     s.session_id = None;
-    state.db.delete_thread_session(&rt.thread_id.to_string())?;
+    state.db.delete_thread_session(&rt.thread_id)?;
     Ok(())
 }
 
-async fn send_silent(http: &Http, channel: ChannelId, content: &str) {
-    for chunk in rendering::split_markdown(content, rendering::DISCORD_MESSAGE_LIMIT) {
-        let msg = CreateMessage::new()
-            .content(chunk)
-            .flags(MessageFlags::SUPPRESS_NOTIFICATIONS);
-        if let Err(err) = channel.send_message(http, msg).await {
-            tracing::warn!("failed to send message to {channel}: {err}");
-        }
+async fn send(chat: &dyn ChatConnector, thread_id: &str, content: &str) {
+    if let Err(err) = chat.send_message(thread_id, content).await {
+        tracing::warn!("failed to send message to {thread_id}: {err:#}");
     }
 }
 
@@ -104,7 +103,7 @@ async fn send_silent(http: &Http, channel: ChannelId, content: &str) {
 /// step after the configured grace period.
 pub async fn enqueue_incoming(
     state: Arc<AppState>,
-    http: Arc<Http>,
+    chat: Arc<dyn ChatConnector>,
     rt: Arc<ThreadRuntime>,
     msg: QueuedMessage,
     queue_delivery: bool,
@@ -113,7 +112,7 @@ pub async fn enqueue_incoming(
     if !s.busy {
         s.busy = true;
         drop(s);
-        tokio::spawn(dispatch_loop(state, http, rt, msg));
+        tokio::spawn(dispatch_loop(state, chat, rt, msg));
         return EnqueueResult::Dispatched;
     }
 
@@ -127,7 +126,7 @@ pub async fn enqueue_incoming(
     // Normal message during a run: it goes to the front of the queue and, if
     // the current step is still going after the grace period, we abort the
     // step so the message takes over (a message acts as an interrupt).
-    let marker = msg.source_message_id;
+    let marker = msg.source_message_id.clone();
     s.queue.push_front(msg);
     drop(s);
 
@@ -157,7 +156,7 @@ pub async fn enqueue_incoming(
 /// Run one prompt, then keep draining the queue until it is empty.
 async fn dispatch_loop(
     state: Arc<AppState>,
-    http: Arc<Http>,
+    chat: Arc<dyn ChatConnector>,
     rt: Arc<ThreadRuntime>,
     first: QueuedMessage,
 ) {
@@ -165,15 +164,15 @@ async fn dispatch_loop(
     loop {
         if current.show_marker {
             let preview = rendering::prompt_preview(&current.prompt, 150);
-            send_silent(
-                &http,
-                rt.thread_id,
+            send(
+                chat.as_ref(),
+                &rt.thread_id,
                 &format!("{}**{}:** {}", rendering::QUEUE_PREFIX, current.username, preview),
             )
             .await;
         }
-        if let Err(err) = run_prompt(&state, &http, &rt, &current.prompt).await {
-            send_silent(&http, rt.thread_id, &format!("⚠️ {err:#}")).await;
+        if let Err(err) = run_prompt(&state, &chat, &rt, &current.prompt).await {
+            send(chat.as_ref(), &rt.thread_id, &format!("⚠️ {err:#}")).await;
         }
         let mut s = rt.state.lock().await;
         match s.queue.pop_front() {
@@ -196,10 +195,10 @@ async fn ensure_session(state: &AppState, rt: &ThreadRuntime) -> Result<(String,
     }
     let session = state
         .oc
-        .create_session(&directory, &format!("discord thread {}", rt.thread_id))
+        .create_session(&directory, &format!("chat thread {}", rt.thread_id))
         .await?;
     s.session_id = Some(session.id.clone());
-    state.db.set_thread_session(&rt.thread_id.to_string(), &session.id)?;
+    state.db.set_thread_session(&rt.thread_id, &session.id)?;
     Ok((session.id, directory))
 }
 
@@ -208,7 +207,7 @@ async fn ensure_session(state: &AppState, rt: &ThreadRuntime) -> Result<(String,
 /// are rendered when the run completes, followed by a duration footer.
 async fn run_prompt(
     state: &Arc<AppState>,
-    http: &Arc<Http>,
+    chat: &Arc<dyn ChatConnector>,
     rt: &Arc<ThreadRuntime>,
     prompt: &str,
 ) -> Result<()> {
@@ -221,8 +220,8 @@ async fn run_prompt(
     // Live renderer: stream tool/progress lines while the run is going.
     let live = {
         let mut events = state.oc.subscribe();
-        let http = http.clone();
-        let thread_id = rt.thread_id;
+        let chat = chat.clone();
+        let thread_id = rt.thread_id.clone();
         let session_id = session_id.clone();
         let rendered = rendered_parts.clone();
         tokio::spawn(async move {
@@ -267,7 +266,7 @@ async fn run_prompt(
                     continue;
                 }
                 if let Some(line) = rendering::format_part(&part) {
-                    send_silent(&http, thread_id, &line).await;
+                    send(chat.as_ref(), &thread_id, &line).await;
                 }
             }
         })
@@ -275,11 +274,11 @@ async fn run_prompt(
 
     // Typing indicator while the run is active.
     let typing = {
-        let http = http.clone();
-        let thread_id = rt.thread_id;
+        let chat = chat.clone();
+        let thread_id = rt.thread_id.clone();
         tokio::spawn(async move {
             loop {
-                let _ = thread_id.broadcast_typing(&http).await;
+                chat.start_typing(&thread_id).await;
                 tokio::time::sleep(Duration::from_secs(8)).await;
             }
         })
@@ -296,24 +295,24 @@ async fn run_prompt(
             continue;
         }
         if let Some(text) = rendering::format_part(part) {
-            send_silent(http, rt.thread_id, &text).await;
+            send(chat.as_ref(), &rt.thread_id, &text).await;
             sent_anything = true;
         }
     }
     if !sent_anything {
-        send_silent(http, rt.thread_id, "⬥ (no reply text)").await;
+        send(chat.as_ref(), &rt.thread_id, "⬥ (no reply text)").await;
     }
-    send_silent(http, rt.thread_id, &rendering::turn_footer(started.elapsed())).await;
+    send(chat.as_ref(), &rt.thread_id, &rendering::turn_footer(started.elapsed())).await;
     Ok(())
 }
 
 // ---- queue management (edits, clears) ----
 
-/// Apply an edit of a Discord message to its queued entry: new text with the
+/// Apply an edit of a chat message to its queued entry: new text with the
 /// queue suffix keeps it (updated), losing the suffix drops it.
 pub async fn update_queue_item_for_edit(
     rt: &ThreadRuntime,
-    source_message_id: MessageId,
+    source_message_id: &str,
     new_content: &str,
 ) -> QueueEditOutcome {
     let parsed = delivery::parse_message(new_content);
@@ -321,7 +320,7 @@ pub async fn update_queue_item_for_edit(
     let Some(pos) = s
         .queue
         .iter()
-        .position(|m| m.source_message_id == Some(source_message_id))
+        .position(|m| m.source_message_id.as_deref() == Some(source_message_id))
     else {
         return QueueEditOutcome::NotFound;
     };
@@ -358,6 +357,91 @@ pub async fn clear_queue(rt: &ThreadRuntime, position: Option<usize>) -> Result<
 pub async fn set_session_id(state: &AppState, rt: &ThreadRuntime, session_id: &str) -> Result<()> {
     let mut s = rt.state.lock().await;
     s.session_id = Some(session_id.to_string());
-    state.db.set_thread_session(&rt.thread_id.to_string(), session_id)?;
+    state.db.set_thread_session(&rt.thread_id, session_id)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A runtime in the "busy" state, as if a run were in flight, so queue
+    /// behavior can be exercised without a chat platform or agent backend.
+    fn busy_runtime() -> ThreadRuntime {
+        ThreadRuntime {
+            thread_id: "thread-1".to_string(),
+            state: Mutex::new(RuntimeState {
+                directory: "/tmp/project".to_string(),
+                session_id: Some("ses_test".to_string()),
+                busy: true,
+                queue: VecDeque::new(),
+            }),
+        }
+    }
+
+    fn msg(prompt: &str, source: Option<&str>) -> QueuedMessage {
+        QueuedMessage {
+            prompt: prompt.to_string(),
+            username: "tester".to_string(),
+            source_message_id: source.map(str::to_string),
+            show_marker: false,
+        }
+    }
+
+    async fn push(rt: &ThreadRuntime, m: QueuedMessage) {
+        rt.state.lock().await.queue.push_back(m);
+    }
+
+    #[tokio::test]
+    async fn edit_with_queue_suffix_updates_prompt() {
+        let rt = busy_runtime();
+        push(&rt, msg("original", Some("m1"))).await;
+
+        let outcome = update_queue_item_for_edit(&rt, "m1", "edited text. queue").await;
+        assert_eq!(outcome, QueueEditOutcome::Updated);
+        assert_eq!(rt.state.lock().await.queue[0].prompt, "edited text");
+    }
+
+    #[tokio::test]
+    async fn edit_without_queue_suffix_removes_entry() {
+        let rt = busy_runtime();
+        push(&rt, msg("original", Some("m1"))).await;
+
+        let outcome = update_queue_item_for_edit(&rt, "m1", "no longer queued").await;
+        assert_eq!(outcome, QueueEditOutcome::Removed);
+        assert!(rt.state.lock().await.queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn edit_of_unknown_message_is_a_noop() {
+        let rt = busy_runtime();
+        push(&rt, msg("original", Some("m1"))).await;
+
+        let outcome = update_queue_item_for_edit(&rt, "m2", "whatever. queue").await;
+        assert_eq!(outcome, QueueEditOutcome::NotFound);
+        assert_eq!(rt.state.lock().await.queue.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn clear_queue_by_position_and_fully() {
+        let rt = busy_runtime();
+        push(&rt, msg("a", Some("m1"))).await;
+        push(&rt, msg("b", Some("m2"))).await;
+        push(&rt, msg("c", Some("m3"))).await;
+
+        // 1-based position removal.
+        assert_eq!(clear_queue(&rt, Some(2)).await.unwrap(), 1);
+        {
+            let s = rt.state.lock().await;
+            assert_eq!(s.queue.len(), 2);
+            assert_eq!(s.queue[0].prompt, "a");
+            assert_eq!(s.queue[1].prompt, "c");
+        }
+        // Out-of-range position errors.
+        assert!(clear_queue(&rt, Some(5)).await.is_err());
+        assert!(clear_queue(&rt, Some(0)).await.is_err());
+        // Clearing everything reports the count.
+        assert_eq!(clear_queue(&rt, None).await.unwrap(), 2);
+        assert!(rt.state.lock().await.queue.is_empty());
+    }
 }

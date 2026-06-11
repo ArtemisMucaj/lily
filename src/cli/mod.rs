@@ -134,7 +134,9 @@ async fn run_bot(config: Config, db: Arc<Db>) -> Result<()> {
         .context("failed to build Discord client")?;
 
     // Scheduled-task loop shares the same HTTP client as the gateway.
-    tokio::spawn(task_runner::run_task_loop(state, client.http.clone()));
+    let chat: std::sync::Arc<dyn crate::application::chat::ChatConnector> =
+        std::sync::Arc::new(discord::DiscordChat { http: client.http.clone() });
+    tokio::spawn(task_runner::run_task_loop(state, chat));
 
     client.start().await.context("Discord client error")?;
     Ok(())
