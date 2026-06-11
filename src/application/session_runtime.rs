@@ -33,13 +33,13 @@ impl AppState {
 
 pub struct ThreadRuntime {
     pub thread_id: ChannelId,
-    /// Working directory of the session (project dir or its worktree).
-    pub directory: String,
     state: Mutex<RuntimeState>,
 }
 
 #[derive(Default)]
 struct RuntimeState {
+    /// Working directory of the session (project dir or its worktree).
+    directory: String,
     session_id: Option<String>,
     busy: bool,
     queue: VecDeque<QueuedMessage>,
@@ -47,6 +47,10 @@ struct RuntimeState {
 
 /// Look up or create the runtime for a thread, restoring the persisted
 /// session id when one exists.
+///
+/// A runtime is never replaced for a live thread: when the resolved directory
+/// changes (worktree became ready, or was merged away), the existing runtime
+/// is retargeted in place so its dispatch loop and queue carry over.
 pub async fn get_or_create_runtime(
     state: &Arc<AppState>,
     thread_id: ChannelId,
@@ -54,20 +58,32 @@ pub async fn get_or_create_runtime(
 ) -> Arc<ThreadRuntime> {
     let mut map = state.runtimes.lock().await;
     if let Some(rt) = map.get(&thread_id) {
-        return rt.clone();
+        let rt = rt.clone();
+        drop(map);
+        let mut s = rt.state.lock().await;
+        if s.directory != directory {
+            tracing::info!("thread {thread_id} working directory changed to {directory}");
+            s.directory = directory;
+        }
+        drop(s);
+        return rt;
     }
     let session_id = state.db.get_thread_session(&thread_id.to_string()).ok().flatten();
     let rt = Arc::new(ThreadRuntime {
         thread_id,
-        directory,
-        state: Mutex::new(RuntimeState { session_id, ..Default::default() }),
+        state: Mutex::new(RuntimeState { directory, session_id, ..Default::default() }),
     });
     map.insert(thread_id, rt.clone());
     rt
 }
 
-pub async fn remove_runtime(state: &Arc<AppState>, thread_id: ChannelId) {
-    state.runtimes.lock().await.remove(&thread_id);
+/// Drop the session binding so the next message starts a fresh session (used
+/// after a merge removes the worktree directory the session lived in).
+pub async fn reset_session(state: &AppState, rt: &ThreadRuntime) -> Result<()> {
+    let mut s = rt.state.lock().await;
+    s.session_id = None;
+    state.db.delete_thread_session(&rt.thread_id.to_string())?;
+    Ok(())
 }
 
 async fn send_silent(http: &Http, channel: ChannelId, content: &str) {
@@ -122,16 +138,17 @@ pub async fn enqueue_incoming(
         let still_waiting =
             s.busy && s.queue.front().map(|m| m.source_message_id == marker).unwrap_or(false);
         let session = s.session_id.clone();
+        let directory = s.directory.clone();
         drop(s);
         if still_waiting
             && let Some(session_id) = session {
                 tracing::info!("interrupting session {session_id} to deliver new message");
-                if let Err(err) = state.oc.abort(&rt.directory, &session_id).await {
+                if let Err(err) = state.oc.abort(&directory, &session_id).await {
                     tracing::warn!("abort failed: {err:#}");
                 }
                 // The aborted prompt call returns and the drain loop picks the
                 // message up; wait_idle is a safety net for lost responses.
-                state.oc.wait_idle(&rt.directory, &session_id, Duration::from_secs(3)).await;
+                state.oc.wait_idle(&directory, &session_id, Duration::from_secs(3)).await;
             }
     });
     EnqueueResult::Dispatched
@@ -169,18 +186,21 @@ async fn dispatch_loop(
     }
 }
 
-async fn ensure_session(state: &AppState, rt: &ThreadRuntime) -> Result<String> {
+/// Returns the session id and the directory it is bound to, creating the
+/// session on first use.
+async fn ensure_session(state: &AppState, rt: &ThreadRuntime) -> Result<(String, String)> {
     let mut s = rt.state.lock().await;
+    let directory = s.directory.clone();
     if let Some(id) = &s.session_id {
-        return Ok(id.clone());
+        return Ok((id.clone(), directory));
     }
     let session = state
         .oc
-        .create_session(&rt.directory, &format!("discord thread {}", rt.thread_id))
+        .create_session(&directory, &format!("discord thread {}", rt.thread_id))
         .await?;
     s.session_id = Some(session.id.clone());
     state.db.set_thread_session(&rt.thread_id.to_string(), &session.id)?;
-    Ok(session.id)
+    Ok((session.id, directory))
 }
 
 /// Send one prompt to the session and render the run into the thread:
@@ -192,7 +212,7 @@ async fn run_prompt(
     rt: &Arc<ThreadRuntime>,
     prompt: &str,
 ) -> Result<()> {
-    let session_id = ensure_session(state, rt).await?;
+    let (session_id, directory) = ensure_session(state, rt).await?;
     let started = std::time::Instant::now();
 
     let rendered_parts: Arc<std::sync::Mutex<HashSet<String>>> =
@@ -206,7 +226,17 @@ async fn run_prompt(
         let session_id = session_id.clone();
         let rendered = rendered_parts.clone();
         tokio::spawn(async move {
-            while let Ok(event) = events.recv().await {
+            loop {
+                let event = match events.recv().await {
+                    Ok(event) => event,
+                    // Falling behind drops the oldest events; keep streaming
+                    // rather than going silent for the rest of the run.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("live renderer lagged, skipped {n} event(s)");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
                 if event.session_id.as_deref() != Some(&session_id) {
                     continue;
                 }
@@ -255,7 +285,7 @@ async fn run_prompt(
         })
     };
 
-    let result = state.oc.prompt(&rt.directory, &session_id, prompt).await;
+    let result = state.oc.prompt(&directory, &session_id, prompt).await;
     live.abort();
     typing.abort();
 

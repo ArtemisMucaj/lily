@@ -56,6 +56,9 @@ pub fn part_from_event(v: &Value) -> Option<Part> {
 
 impl OpencodeClient {
     pub fn new(base_url: &str) -> Self {
+        // Capacity 1024: receivers that fall further behind see a Lagged error
+        // and skip the dropped events; renderers tolerate this (tool lines are
+        // best-effort, final text comes from the prompt response).
         let (tx, _) = broadcast::channel(1024);
         Self {
             http: reqwest::Client::new(),
@@ -112,10 +115,13 @@ impl OpencodeClient {
             .await
             .context("opencode: prompt request failed")?;
         let status = resp.status();
-        let body: Value = resp.json().await.unwrap_or(Value::Null);
         if !status.is_success() {
+            // Error bodies are best-effort; the status code is the signal.
+            let body: Value = resp.json().await.unwrap_or(Value::Null);
             return Err(anyhow!("opencode: prompt returned {status}: {body}"));
         }
+        let body: Value =
+            resp.json().await.context("opencode: failed to parse prompt response body")?;
         let parts = body
             .get("parts")
             .and_then(Value::as_array)
@@ -189,18 +195,24 @@ impl OpencodeClient {
             .await?
             .error_for_status()?;
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        // Buffer raw bytes: a network chunk can end mid-codepoint, so UTF-8 is
+        // only decoded per complete event (the \n\n delimiter can never appear
+        // inside a multi-byte sequence).
+        let mut buf: Vec<u8> = Vec::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            buf.push_str(&String::from_utf8_lossy(&chunk));
+            buf.extend_from_slice(&chunk?);
             // SSE messages are separated by blank lines.
-            while let Some(pos) = buf.find("\n\n") {
-                let raw = buf[..pos].to_string();
-                buf.drain(..pos + 2);
+            while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+                let raw: Vec<u8> = buf.drain(..pos + 2).collect();
+                let raw = String::from_utf8_lossy(&raw[..pos]);
                 for line in raw.lines() {
                     let Some(data) = line.strip_prefix("data:") else { continue };
-                    let Ok(value) = serde_json::from_str::<Value>(data.trim()) else { continue };
-                    self.broadcast_event(value);
+                    match serde_json::from_str::<Value>(data.trim()) {
+                        Ok(value) => self.broadcast_event(value),
+                        Err(err) => {
+                            tracing::debug!("opencode: skipping unparseable SSE data ({err}): {}", data.trim());
+                        }
+                    }
                 }
             }
         }
@@ -216,6 +228,8 @@ impl OpencodeClient {
             .or_else(|| props.get("info").and_then(|i| i.get("sessionID")))
             .and_then(Value::as_str)
             .map(str::to_string);
+        // A send error only means there are no subscribers right now (no run
+        // is rendering); that is normal between runs, not event loss.
         let _ = self.events.send(Event { kind, session_id, payload: value });
     }
 }

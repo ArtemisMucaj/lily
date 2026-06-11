@@ -186,7 +186,15 @@ fn run_send(
             if notify_only {
                 return Err(anyhow!("--notify-only only applies to channel sends"));
             }
-            TaskPayload::Thread { thread_id: t.clone(), prompt: prompt.clone(), user_id: user }
+            // Thread sends post into an existing thread: there is no thread to
+            // name and no member to add, so reject flags that would be ignored.
+            if name.is_some() {
+                return Err(anyhow!("--name only applies to channel sends"));
+            }
+            if user.is_some() {
+                return Err(anyhow!("--user only applies to channel sends"));
+            }
+            TaskPayload::Thread { thread_id: t.clone(), prompt: prompt.clone(), user_id: None }
         }
         _ => return Err(anyhow!("pass exactly one of --channel or --thread")),
     };
@@ -237,44 +245,48 @@ fn run_task(command: TaskCommands, db: Arc<Db>) -> Result<()> {
             if prompt.is_none() && send_at.is_none() {
                 return Err(anyhow!("pass --prompt and/or --send-at"));
             }
+            let task = db
+                .list_tasks(true)?
+                .into_iter()
+                .find(|t| t.id == id)
+                .ok_or_else(|| anyhow!("task #{id} not found"))?;
+
+            // Validate and build both mutations fully before touching the
+            // database, then apply them in one atomic update so a failed
+            // --send-at can't leave a half-edited task behind.
+            let mut payload: TaskPayload = serde_json::from_str(&task.payload_json)?;
+            let mut preview = task.prompt_preview.clone();
             if let Some(p) = &prompt {
                 if p.len() > PROMPT_MAX_LEN {
                     return Err(anyhow!("prompt exceeds {PROMPT_MAX_LEN} characters"));
                 }
-                // Rewrite the payload with the new prompt, keeping its shape.
-                let task = db
-                    .list_tasks(true)?
-                    .into_iter()
-                    .find(|t| t.id == id)
-                    .ok_or_else(|| anyhow!("task #{id} not found"))?;
-                let mut payload: TaskPayload = serde_json::from_str(&task.payload_json)?;
                 match &mut payload {
                     TaskPayload::Thread { prompt: old, .. } => *old = p.clone(),
                     TaskPayload::Channel { prompt: old, .. } => *old = p.clone(),
                 }
-                let payload_json = serde_json::to_string(&payload)?;
-                let preview = rendering::prompt_preview(p, 120);
-                if !db.update_task(id, Some(&payload_json), Some(&preview), None)? {
-                    return Err(anyhow!("task #{id} is no longer planned"));
-                }
+                preview = rendering::prompt_preview(p, 120);
             }
-            if let Some(v) = &send_at {
-                let parsed = parse_send_at(v, Utc::now())?;
-                let updated = db.update_task(
-                    id,
-                    None,
-                    None,
-                    Some((
-                        parsed.schedule_kind,
-                        parsed.run_at,
-                        parsed.cron_expr.as_deref(),
-                        parsed.timezone.as_deref(),
-                        parsed.next_run_at,
-                    )),
-                )?;
-                if !updated {
-                    return Err(anyhow!("task #{id} is no longer planned"));
-                }
+            let payload_json = serde_json::to_string(&payload)?;
+
+            let parsed = send_at.as_deref().map(|v| parse_send_at(v, Utc::now())).transpose()?;
+            let schedule = match &parsed {
+                Some(p) => (
+                    p.schedule_kind,
+                    p.run_at,
+                    p.cron_expr.as_deref(),
+                    p.timezone.as_deref(),
+                    p.next_run_at,
+                ),
+                None => (
+                    task.schedule_kind.as_str(),
+                    task.run_at,
+                    task.cron_expr.as_deref(),
+                    task.timezone.as_deref(),
+                    task.next_run_at,
+                ),
+            };
+            if !db.update_task(id, &payload_json, &preview, schedule)? {
+                return Err(anyhow!("task #{id} is no longer planned"));
             }
             println!("Updated task #{id}");
             Ok(())

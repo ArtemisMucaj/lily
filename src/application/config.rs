@@ -14,6 +14,9 @@ pub struct Config {
     /// How long a message waits behind a running step before lily aborts the
     /// step and force-delivers it (`LILY_INTERRUPT_STEP_TIMEOUT_MS`).
     pub interrupt_timeout_ms: u64,
+    /// Discord user ids allowed to drive the bot (`LILY_ALLOWED_USERS`,
+    /// comma-separated). Empty means every guild member is allowed.
+    pub allowed_users: Vec<u64>,
 }
 
 impl Config {
@@ -21,7 +24,10 @@ impl Config {
         let data_dir = match std::env::var("LILY_DATA_DIR") {
             Ok(v) => PathBuf::from(v),
             Err(_) => {
-                let home = std::env::var("HOME").context("HOME is not set")?;
+                // USERPROFILE covers native Windows, where HOME is unset.
+                let home = std::env::var("HOME")
+                    .or_else(|_| std::env::var("USERPROFILE"))
+                    .context("neither HOME nor USERPROFILE is set")?;
                 PathBuf::from(home).join(".lily")
             }
         };
@@ -34,7 +40,16 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3000),
+            allowed_users: std::env::var("LILY_ALLOWED_USERS")
+                .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
+                .unwrap_or_default(),
         })
+    }
+
+    /// True when `user_id` may drive the bot. An empty allowlist permits
+    /// everyone (single-user/private-server setups).
+    pub fn is_user_allowed(&self, user_id: u64) -> bool {
+        self.allowed_users.is_empty() || self.allowed_users.contains(&user_id)
     }
 
     pub fn db_path(&self) -> PathBuf {

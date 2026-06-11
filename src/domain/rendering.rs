@@ -92,6 +92,8 @@ pub fn format_part(part: &Part) -> Option<String> {
         }
         "reasoning" => Some(format!("{TOOL_PREFIX}thinking")),
         "file" => {
+            // `filename` is canonical in OpenCode file parts; `file` is kept
+            // as a fallback for older event shapes.
             let name = p
                 .get("filename")
                 .or_else(|| p.get("file"))

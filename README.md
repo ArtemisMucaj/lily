@@ -44,7 +44,14 @@ cargo run --release -- run
 
 Configuration is environment-based: `DISCORD_TOKEN`, `OPENCODE_URL`
 (default `http://127.0.0.1:4096`), `LILY_DATA_DIR` (default `~/.lily`),
-`LILY_INTERRUPT_STEP_TIMEOUT_MS` (default `3000`).
+`LILY_INTERRUPT_STEP_TIMEOUT_MS` (default `3000`), and `LILY_ALLOWED_USERS`
+(comma-separated Discord user ids; when set, everyone else is ignored).
+
+**Authorization:** the bot runs agents on the host machine, so lock it down.
+Sensitive commands (`/add-project`, `/new-worktree`, `/merge-worktree`,
+`/cancel-task`) default to members with **Manage Guild**; adjust per command in
+Server Settings → Integrations. For private setups, set `LILY_ALLOWED_USERS`
+to your own user id so no one else can start sessions at all.
 
 ## Message handling
 
@@ -146,7 +153,7 @@ The crate is layered domain-driven-design style. Dependencies point inward:
 `domain` depends on nothing, `application` orchestrates domain rules over
 connectors, `cli` wires it all together.
 
-```
+```text
 src/
   main.rs                        thin entry point
   cli/

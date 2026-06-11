@@ -135,6 +135,13 @@ impl Db {
         })
     }
 
+    pub fn delete_thread_session(&self, thread_id: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM thread_sessions WHERE thread_id = ?1", params![thread_id])?;
+            Ok(())
+        })
+    }
+
     pub fn get_thread_session(&self, thread_id: &str) -> Result<Option<String>> {
         self.with(|c| {
             Ok(c.query_row(
@@ -264,10 +271,14 @@ impl Db {
         })
     }
 
-    fn task_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(ScheduledTask, Option<String>, String)> {
-        // Returns task plus raw run_at / next_run_at strings for later parsing.
+    fn task_from_row(
+        r: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<(ScheduledTask, Option<String>, String, Option<String>)> {
+        // Returns task plus raw run_at / next_run_at / last_run_at strings for
+        // later parsing.
         let run_at_raw: Option<String> = r.get(3)?;
         let next_run_raw: String = r.get(6)?;
+        let last_run_raw: Option<String> = r.get(7)?;
         Ok((
             ScheduledTask {
                 id: r.get(0)?,
@@ -287,16 +298,20 @@ impl Db {
             },
             run_at_raw,
             next_run_raw,
+            last_run_raw,
         ))
     }
 
     const TASK_COLS: &'static str = "id, status, schedule_kind, run_at, cron_expr, timezone, \
         next_run_at, last_run_at, last_error, attempts, payload_json, prompt_preview, channel_id, thread_id";
 
-    fn finish_task(raw: (ScheduledTask, Option<String>, String)) -> Result<ScheduledTask> {
-        let (mut t, run_at_raw, next_run_raw) = raw;
+    fn finish_task(
+        raw: (ScheduledTask, Option<String>, String, Option<String>),
+    ) -> Result<ScheduledTask> {
+        let (mut t, run_at_raw, next_run_raw, last_run_raw) = raw;
         t.run_at = run_at_raw.as_deref().map(parse_ts).transpose()?;
         t.next_run_at = parse_ts(&next_run_raw)?;
+        t.last_run_at = last_run_raw.as_deref().map(parse_ts).transpose()?;
         Ok(t)
     }
 
@@ -361,8 +376,11 @@ impl Db {
     pub fn mark_task_completed(&self, task_id: i64, completed_at: DateTime<Utc>) -> Result<()> {
         self.with(|c| {
             c.execute(
+                // Guarded on 'running' so a finishing worker never overwrites
+                // a cancellation that landed mid-run.
                 "UPDATE scheduled_tasks SET status='completed', last_run_at=?2,
-                   running_started_at=NULL, last_error=NULL, updated_at=?2 WHERE id = ?1",
+                   running_started_at=NULL, last_error=NULL, updated_at=?2
+                 WHERE id = ?1 AND status='running'",
                 params![task_id, ts(completed_at)],
             )?;
             Ok(())
@@ -381,7 +399,7 @@ impl Db {
                 "UPDATE scheduled_tasks SET status='planned', next_run_at=?3, last_run_at=?2,
                    running_started_at=NULL, last_error=?4,
                    attempts = attempts + (CASE WHEN ?4 IS NULL THEN 0 ELSE 1 END), updated_at=?2
-                 WHERE id = ?1",
+                 WHERE id = ?1 AND status='running'",
                 params![task_id, ts(completed_at), ts(next_run_at), error],
             )?;
             Ok(())
@@ -392,7 +410,8 @@ impl Db {
         self.with(|c| {
             c.execute(
                 "UPDATE scheduled_tasks SET status='failed', last_run_at=?2, last_error=?3,
-                   running_started_at=NULL, attempts = attempts + 1, updated_at=?2 WHERE id = ?1",
+                   running_started_at=NULL, attempts = attempts + 1, updated_at=?2
+                 WHERE id = ?1 AND status='running'",
                 params![task_id, ts(failed_at), error],
             )?;
             Ok(())
@@ -410,31 +429,25 @@ impl Db {
         })
     }
 
-    /// Update prompt/schedule of a still-planned task. Returns false when the
-    /// task already started or finished.
+    /// Replace the prompt payload and schedule of a still-planned task in one
+    /// statement, so a concurrent scheduler claim can never observe (or
+    /// preserve) a half-applied edit. Returns false when the task already
+    /// started or finished.
     pub fn update_task(
         &self,
         task_id: i64,
-        payload_json: Option<&str>,
-        prompt_preview: Option<&str>,
-        schedule: Option<ScheduleUpdate<'_>>,
+        payload_json: &str,
+        prompt_preview: &str,
+        schedule: ScheduleUpdate<'_>,
     ) -> Result<bool> {
+        let (kind, run_at, cron, tz, next) = schedule;
         self.with(|c| {
-            let mut n = 0;
-            if let Some(p) = payload_json {
-                n = c.execute(
-                    "UPDATE scheduled_tasks SET payload_json=?2, prompt_preview=?3
-                     WHERE id = ?1 AND status='planned'",
-                    params![task_id, p, prompt_preview.unwrap_or("")],
-                )?;
-            }
-            if let Some((kind, run_at, cron, tz, next)) = schedule {
-                n = c.execute(
-                    "UPDATE scheduled_tasks SET schedule_kind=?2, run_at=?3, cron_expr=?4,
-                       timezone=?5, next_run_at=?6 WHERE id = ?1 AND status='planned'",
-                    params![task_id, kind, run_at.map(ts), cron, tz, ts(next)],
-                )?;
-            }
+            let n = c.execute(
+                "UPDATE scheduled_tasks SET payload_json=?2, prompt_preview=?3,
+                   schedule_kind=?4, run_at=?5, cron_expr=?6, timezone=?7, next_run_at=?8
+                 WHERE id = ?1 AND status='planned'",
+                params![task_id, payload_json, prompt_preview, kind, run_at.map(ts), cron, tz, ts(next)],
+            )?;
             Ok(n == 1)
         })
     }

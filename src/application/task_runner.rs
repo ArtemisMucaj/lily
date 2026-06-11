@@ -151,11 +151,28 @@ pub async fn resolve_thread_directory(
     http: &Arc<Http>,
     thread_id: ChannelId,
 ) -> Result<String> {
-    if let Some(wt) = state.db.get_thread_worktree(&thread_id.to_string())?
-        && wt.status == "ready"
-            && let Some(dir) = wt.worktree_directory {
-                return Ok(dir);
+    if let Some(wt) = state.db.get_thread_worktree(&thread_id.to_string())? {
+        // Never fall back to the project directory while a worktree is
+        // assigned: running there would break the isolation the worktree
+        // exists to provide.
+        match wt.status.as_str() {
+            "ready" => {
+                if let Some(dir) = wt.worktree_directory {
+                    return Ok(dir);
+                }
+                return Err(anyhow!("worktree is marked ready but has no directory"));
             }
+            "pending" => {
+                return Err(anyhow!(
+                    "the worktree for this thread is still being created; try again in a moment"
+                ));
+            }
+            other => {
+                let detail = wt.error_message.map(|e| format!(": {e}")).unwrap_or_default();
+                return Err(anyhow!("worktree is in state '{other}'{detail}"));
+            }
+        }
+    }
     // The thread's session directory comes from the parent channel mapping.
     let channel = thread_id.to_channel(http).await.context("failed to fetch thread channel")?;
     let guild_channel = channel.guild().ok_or_else(|| anyhow!("not a guild thread"))?;

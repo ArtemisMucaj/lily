@@ -19,7 +19,7 @@ use serenity::all::{
     Context, CreateCommand, CreateCommandOption, CreateInteractionResponse,
     CreateInteractionResponseFollowup, CreateInteractionResponseMessage, CreateThread, EditChannel,
     EditThread, EventHandler, GuildChannel, Http, Interaction, Message, MessageId,
-    MessageUpdateEvent, Ready, ResolvedValue,
+    MessageUpdateEvent, Permissions, Ready, ResolvedValue,
 };
 use serenity::async_trait;
 use std::sync::Arc;
@@ -41,6 +41,11 @@ impl EventHandler for Handler {
         if msg.author.bot || msg.content.trim().is_empty() {
             return;
         }
+        // Messages in project channels start agent runs on the host machine;
+        // ignore users outside the allowlist (when one is configured).
+        if !self.state.config.is_user_allowed(msg.author.id.get()) {
+            return;
+        }
         if let Err(err) = self.handle_message(&ctx, &msg).await {
             tracing::warn!("message handling failed: {err:#}");
             let _ = msg.channel_id.say(&ctx.http, format!("⚠️ {err:#}")).await;
@@ -56,7 +61,7 @@ impl EventHandler for Handler {
     ) {
         let Some(content) = event.content.clone() else { return };
         let Some(author) = event.author.clone() else { return };
-        if author.bot {
+        if author.bot || !self.state.config.is_user_allowed(author.id.get()) {
             return;
         }
         if let Err(err) = self
@@ -69,6 +74,19 @@ impl EventHandler for Handler {
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         let Interaction::Command(cmd) = interaction else { return };
+        if !self.state.config.is_user_allowed(cmd.user.id.get()) {
+            let _ = cmd
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("You are not authorized to use this bot.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        }
         if let Err(err) = self.handle_command(&ctx, &cmd).await {
             tracing::warn!("command /{} failed: {err:#}", cmd.data.name);
             let message = format!("⚠️ {err:#}");
@@ -95,9 +113,14 @@ impl EventHandler for Handler {
 }
 
 async fn register_commands(http: &Http) -> Result<()> {
+    // Commands that point the bot at host directories or mutate git/task state
+    // default to Manage Guild; server admins can adjust this per command in
+    // Server Settings → Integrations.
+    let admin = Permissions::MANAGE_GUILD;
     let commands = vec![
         CreateCommand::new("add-project")
             .description("Link this channel to a project directory on the bot's machine")
+            .default_member_permissions(admin)
             .add_option(
                 CreateCommandOption::new(
                     CommandOptionType::String,
@@ -127,6 +150,7 @@ async fn register_commands(http: &Http) -> Result<()> {
             ),
         CreateCommand::new("new-worktree")
             .description("Move this session into an isolated git worktree")
+            .default_member_permissions(admin)
             .add_option(CreateCommandOption::new(
                 CommandOptionType::String,
                 "name",
@@ -139,6 +163,7 @@ async fn register_commands(http: &Http) -> Result<()> {
             )),
         CreateCommand::new("merge-worktree")
             .description("Rebase this thread's worktree commits back onto the default branch")
+            .default_member_permissions(admin)
             .add_option(CreateCommandOption::new(
                 CommandOptionType::String,
                 "target-branch",
@@ -148,6 +173,7 @@ async fn register_commands(http: &Http) -> Result<()> {
         CreateCommand::new("tasks").description("List scheduled tasks"),
         CreateCommand::new("cancel-task")
             .description("Cancel a scheduled task by id")
+            .default_member_permissions(admin)
             .add_option(
                 CreateCommandOption::new(CommandOptionType::Integer, "id", "Task id from /tasks")
                     .required(true),
@@ -617,12 +643,11 @@ impl Handler {
                     if let Err(err) = state.db.set_worktree_ready(&thread_id.to_string(), &dir_str) {
                         tracing::warn!("failed to persist worktree state: {err:#}");
                     }
-                    // Sessions resolve their directory per runtime; replace the
-                    // runtime so the next message runs inside the worktree. If a
-                    // session already exists, fork it into the worktree so the
-                    // context carries over.
+                    // Retarget the thread's runtime in place (keeping its queue
+                    // and dispatch loop) so the next message runs inside the
+                    // worktree. If a session already exists, fork it into the
+                    // worktree so the context carries over.
                     let old_session = state.db.get_thread_session(&thread_id.to_string()).ok().flatten();
-                    runner::remove_runtime(&state, thread_id).await;
                     let rt = runner::get_or_create_runtime(&state, thread_id, dir_str.clone()).await;
                     if let Some(old) = old_session {
                         match state.oc.fork_session(&dir_str, &old).await {
@@ -693,8 +718,16 @@ impl Handler {
         match outcome {
             worktree::MergeOutcome::Success { target_branch, branch_name, commit_count, short_sha } => {
                 self.state.db.delete_thread_worktree(&cmd.channel_id.to_string())?;
-                // The session's directory is gone; point the runtime back at the project.
-                runner::remove_runtime(&self.state, cmd.channel_id).await;
+                // The worktree directory is gone: retarget the runtime back at
+                // the project (keeping its queue) and drop the session that was
+                // bound to the removed directory.
+                let rt = runner::get_or_create_runtime(
+                    &self.state,
+                    cmd.channel_id,
+                    wt.project_directory.clone(),
+                )
+                .await;
+                runner::reset_session(&self.state, &rt).await?;
                 if let Some(stripped) = channel.name.strip_prefix(worktree::THREAD_PREFIX.trim_end()) {
                     let _ = cmd
                         .channel_id
