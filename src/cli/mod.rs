@@ -15,7 +15,22 @@ use clap::{Parser, Subcommand};
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "lily", version, about = "Drive coding agents from Discord: channels are projects, threads are sessions")]
+#[command(
+    name = "lily",
+    version,
+    about = "Drive coding agents from chat: channels and rooms are projects, threads are sessions",
+    long_about = "lily bridges Discord and/or Matrix to a local OpenCode server.\n\
+        \n\
+        A linked channel (Discord) or room (Matrix) maps to a project directory on this\n\
+        machine. Sending a message starts or continues an AI coding session in a thread;\n\
+        the agent edits code in that directory and replies in the thread.\n\
+        \n\
+        Both connectors can run simultaneously. Configure via environment variables:\n\
+        \n\
+        Discord: DISCORD_TOKEN\n\
+        Matrix:  MATRIX_HOMESERVER, MATRIX_USER, MATRIX_PASSWORD\n\
+        Common:  OPENCODE_URL (default http://127.0.0.1:4096), LILY_DATA_DIR (default ~/.lily)"
+)]
 pub struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -23,7 +38,16 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run the Discord bot (requires DISCORD_TOKEN and a running `opencode serve`).
+    /// Start the bot gateway (requires a running `opencode serve` and at least one connector).
+    #[command(long_about = "Start the bot gateway (requires a running `opencode serve` and at least one connector).\n\
+        \n\
+        Configure connectors via environment variables:\n\
+        \n\
+        \x20 Discord  — set DISCORD_TOKEN\n\
+        \x20 Matrix   — set MATRIX_HOMESERVER, MATRIX_USER, MATRIX_PASSWORD\n\
+        \n\
+        Both connectors can be active at the same time. Scheduled tasks created with\n\
+        `lily send` are routed to whichever platform the target channel/thread belongs to.")]
     Run,
     /// Manage project ↔ channel links.
     Project {
@@ -31,27 +55,34 @@ enum Commands {
         command: ProjectCommands,
     },
     /// Send a prompt to a project channel or thread, now or on a schedule.
+    ///
+    /// The running bot picks the task up within one scheduler poll interval (~30 s).
+    /// Pass --send-at to schedule it for a specific time or on a recurring cron schedule.
     Send {
-        /// Project channel id to start a new thread in.
+        /// Channel or room id to start a new thread in.
+        /// Discord: numeric snowflake. Matrix: room id of the form !room:server.
         #[arg(long, conflicts_with = "thread")]
         channel: Option<String>,
         /// Existing thread id to continue.
+        /// Discord: numeric snowflake. Matrix: room|event-id as shown by the bot.
         #[arg(long)]
         thread: Option<String>,
         /// The prompt text.
         #[arg(long)]
         prompt: String,
-        /// UTC ISO timestamp ending in Z (one-time) or a cron expression
-        /// (recurring, UTC). Omit to send as soon as the bot picks it up.
+        /// When to send: a UTC ISO timestamp ending in Z for a one-time send
+        /// (e.g. 2026-06-01T09:00:00Z), or a cron expression for a recurring
+        /// schedule (e.g. "0 9 * * 1-5"). Omit to send immediately.
         #[arg(long = "send-at")]
         send_at: Option<String>,
-        /// Post the message without starting an AI session.
+        /// Post the message as a plain notification without starting an AI session
+        /// (channel sends only).
         #[arg(long = "notify-only", default_value_t = false)]
         notify_only: bool,
-        /// Thread name (channel sends only).
+        /// Thread name to use when creating a new thread (channel sends only).
         #[arg(long)]
         name: Option<String>,
-        /// Discord user id to add to the created thread.
+        /// Discord user id to invite to the created thread (Discord channel sends only).
         #[arg(long)]
         user: Option<String>,
     },
@@ -64,11 +95,15 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ProjectCommands {
-    /// Link a Discord channel to a project directory.
+    /// Link a channel or room to a project directory on this machine.
+    ///
+    /// After linking, messages in that channel or room start AI coding sessions
+    /// against the given directory. Pass a Discord channel snowflake or a
+    /// Matrix room id (!room:server) to --channel.
     Add {
-        /// Project directory (defaults to the current directory).
+        /// Absolute path of the project directory (defaults to the current directory).
         directory: Option<String>,
-        /// Discord channel id to link.
+        /// Channel or room id to link: Discord snowflake or Matrix room id (!room:server).
         #[arg(long)]
         channel: String,
     },
