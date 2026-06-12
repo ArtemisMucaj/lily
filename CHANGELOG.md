@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/ArtemisMucaj/lily/compare/v0.2.0...v0.3.0) (2026-06-12)
+
+
+### Features
+
+* add Docker Sandbox kit for lily deployment ([#7](https://github.com/ArtemisMucaj/lily/issues/7)) ([ddd4a02](https://github.com/ArtemisMucaj/lily/commit/ddd4a020a8a1a2da9ed222ead6ed8ce5939caa2d))
+
 ## [0.2.0](https://github.com/ArtemisMucaj/lily/compare/v0.1.0...v0.2.0) (2026-06-12)
 
 
