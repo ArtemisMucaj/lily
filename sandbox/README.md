@@ -61,7 +61,7 @@ The short version — [`sandbox/up`](up) builds the image, loads the template,
 and runs the stack in one go (configure first, see step 2):
 
 ```bash
-sandbox/up ~/code/my-project            # add --skip-build to reuse the template
+sandbox/up --build ~/code/my-project    # drop --build once the template is loaded
 ```
 
 The same thing step by step:
