@@ -5,9 +5,9 @@
 #
 # The image extends the official `opencode` sandbox template (which ships the
 # opencode agent and satisfies the sandbox base-image contract: `agent` user at
-# UID 1000 with passwordless sudo) and adds lily, a Synapse Matrix homeserver,
-# and the ngrok agent. The kit in sandbox/kit/ boots everything via
-# `lily-sandbox-up`.
+# UID 1000 with passwordless sudo) and adds lily, the Tuwunel Matrix
+# homeserver, and the ngrok agent. The kit in sandbox/kit/ boots everything
+# via `lily-sandbox-up`.
 
 FROM rust:1 AS lily-builder
 WORKDIR /src
@@ -19,13 +19,21 @@ FROM docker/sandbox-templates:opencode
 
 USER root
 
-# Synapse lives in its own venv so it never collides with project tooling.
+# Tuwunel (https://github.com/matrix-construct/tuwunel) — lightweight Matrix
+# homeserver, single binary, conduwuit's official successor.
+ARG TUWUNEL_VERSION=1.7.1
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-venv curl jq ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && python3 -m venv /opt/synapse \
-    && /opt/synapse/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/synapse/bin/pip install --no-cache-dir matrix-synapse
+    && apt-get install -y --no-install-recommends curl jq ca-certificates \
+    && case "$(dpkg --print-architecture)" in \
+        amd64) TUWUNEL_ARCH=x86_64-v1 ;; \
+        arm64) TUWUNEL_ARCH=aarch64-v8 ;; \
+        *) echo "unsupported architecture for tuwunel" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL -o /tmp/tuwunel.deb \
+        "https://github.com/matrix-construct/tuwunel/releases/download/v${TUWUNEL_VERSION}/v${TUWUNEL_VERSION}-release-all-${TUWUNEL_ARCH}-linux-gnu-tuwunel.deb" \
+    && apt-get install -y --no-install-recommends /tmp/tuwunel.deb \
+    && rm -f /tmp/tuwunel.deb \
+    && rm -rf /var/lib/apt/lists/*
 
 # ngrok agent (v3); the tunnel is only opened when NGROK_AUTHTOKEN is set.
 RUN ARCH="$(dpkg --print-architecture)" \

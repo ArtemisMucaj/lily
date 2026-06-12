@@ -9,7 +9,7 @@ displayName: Lily
 description: >
   Chat-driven coding agent orchestrator: lily bridges a private Matrix
   homeserver (and optionally Discord) to an opencode server, all inside one
-  sandbox. Boots Synapse (federation off, registration closed), opencode
+  sandbox. Boots Tuwunel (federation off, registration token-gated), opencode
   serve, an optional ngrok tunnel, and lily itself.
 
 agent:

@@ -2,8 +2,8 @@
 # lily-sandbox-up — entrypoint for the lily Docker Sandbox kit.
 #
 # Boots the full lily experience inside one sandbox microVM:
-#   1. a locked-down Synapse Matrix homeserver (no federation, registration
-#      closed, data shared with the host under ~/.lily/sandbox/matrix)
+#   1. a locked-down Tuwunel Matrix homeserver (no federation, registration
+#      token-gated, data shared with the host under ~/.lily/sandbox/matrix)
 #   2. opencode serve on 127.0.0.1:4096
 #   3. an optional ngrok tunnel for reaching Matrix from outside (only when
 #      NGROK_AUTHTOKEN is set)
@@ -29,7 +29,15 @@ wait_http() {
     done
 }
 
-SYNAPSE=/opt/synapse/bin
+HS_URL="http://127.0.0.1:8008"
+
+TUWUNEL="$(command -v tuwunel || true)"
+if [ -z "$TUWUNEL" ]; then
+    for p in /usr/sbin/tuwunel /usr/bin/tuwunel /usr/local/bin/tuwunel; do
+        [ -x "$p" ] && TUWUNEL="$p" && break
+    done
+fi
+[ -n "$TUWUNEL" ] || die "tuwunel binary not found"
 
 # ---------------------------------------------------------------------------
 # Locate the data dir. Docker Sandboxes mount workspaces at their host
@@ -62,34 +70,23 @@ BOT_MXID="@$BOT_LOCALPART:$SERVER_NAME"
 OWNER_MXID="@$OWNER_LOCALPART:$SERVER_NAME"
 
 # Matrix data is shared with the host by default. `local` keeps the live
-# databases on the sandbox disk instead — the escape hatch if SQLite misbehaves
-# on the passthrough filesystem.
+# database on the sandbox disk instead — the escape hatch if RocksDB
+# misbehaves on the passthrough filesystem.
 case "${LILY_SANDBOX_MATRIX_DATA:-shared}" in
     shared) MATRIX_DIR="$SANDBOX_DIR/matrix" ;;
     local) MATRIX_DIR="$HOME/.lily-matrix" ;;
     *) die "LILY_SANDBOX_MATRIX_DATA must be 'shared' or 'local'" ;;
 esac
-mkdir -p "$MATRIX_DIR"
+mkdir -p "$MATRIX_DIR/db"
 chmod 700 "$MATRIX_DIR"
 
 # ---------------------------------------------------------------------------
-# Synapse configuration. --generate-config runs once (it mints the signing key
-# and secrets); the hardening overlay is rewritten on every boot and wins over
-# the generated file, so the lockdown cannot drift.
+# Tuwunel configuration, rewritten on every boot so the lockdown cannot
+# drift: federation is disabled entirely and registration only works with the
+# local token, which doubles as the provisioning secret below.
 # ---------------------------------------------------------------------------
-HS_CONFIG="$MATRIX_DIR/homeserver.yaml"
-HS_HARDENING="$MATRIX_DIR/lily-hardening.yaml"
+HS_CONFIG="$MATRIX_DIR/tuwunel.toml"
 REG_SECRET_FILE="$MATRIX_DIR/registration.secret"
-
-if [ ! -f "$HS_CONFIG" ]; then
-    log "generating Synapse config (server_name=$SERVER_NAME)"
-    "$SYNAPSE/python" -m synapse.app.homeserver \
-        --generate-config \
-        --config-path "$HS_CONFIG" \
-        --data-directory "$MATRIX_DIR" \
-        --server-name "$SERVER_NAME" \
-        --report-stats no >/dev/null
-fi
 
 if [ ! -f "$REG_SECRET_FILE" ]; then
     (
@@ -99,37 +96,22 @@ if [ ! -f "$REG_SECRET_FILE" ]; then
 fi
 REG_SECRET="$(cat "$REG_SECRET_FILE")"
 
-# Private single-tenant homeserver: the federation API is not served at all
-# (no `federation` listener resource), outbound federation is disabled by the
-# empty whitelist, and registration is closed — accounts can only be created
-# with the local shared secret.
-{
-    cat <<EOF
-enable_registration: false
-enable_registration_without_verification: false
-registration_shared_secret: "$REG_SECRET"
-federation_domain_whitelist: []
-allow_public_rooms_over_federation: false
-allow_public_rooms_without_auth: false
-serve_server_wellknown: false
-report_stats: false
-trusted_key_servers: []
-suppress_key_server_warning: true
-listeners:
-  - port: 8008
-    type: http
-    tls: false
-    x_forwarded: true
-    bind_addresses: ['0.0.0.0']
-    resources:
-      - names: [client]
-        compress: false
+(
+    umask 077
+    cat >"$HS_CONFIG" <<EOF
+# Written by lily-sandbox-up on every boot — edits here do not persist.
+[global]
+server_name = "$SERVER_NAME"
+database_path = "$MATRIX_DIR/db"
+address = "0.0.0.0"
+port = 8008
+allow_federation = false
+allow_registration = true
+registration_token = "$REG_SECRET"
+trusted_servers = []
+allow_check_for_updates = false
 EOF
-    if [ -n "${NGROK_DOMAIN:-}" ]; then
-        printf 'public_baseurl: "https://%s/"\n' "$NGROK_DOMAIN"
-    fi
-} >"$HS_HARDENING"
-chmod 600 "$HS_HARDENING"
+)
 
 # ---------------------------------------------------------------------------
 # Services. Reconnecting to an existing sandbox reruns this entrypoint, so
@@ -143,25 +125,48 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-if wait_http "http://127.0.0.1:8008/health" 1; then
-    log "Synapse already running"
+if wait_http "$HS_URL/_matrix/client/versions" 1; then
+    log "Tuwunel already running"
 else
-    log "starting Synapse"
-    "$SYNAPSE/python" -m synapse.app.homeserver \
-        -c "$HS_CONFIG" -c "$HS_HARDENING" >>"$LOG_DIR/synapse.log" 2>&1 &
-    wait_http "http://127.0.0.1:8008/health" 90 \
-        || die "Synapse did not become healthy; see $LOG_DIR/synapse.log"
+    log "starting Tuwunel"
+    "$TUWUNEL" -c "$HS_CONFIG" >>"$LOG_DIR/tuwunel.log" 2>&1 &
+    wait_http "$HS_URL/_matrix/client/versions" 90 \
+        || die "Tuwunel did not come up; see $LOG_DIR/tuwunel.log"
 fi
+
+# Register an account through the token-gated UIAA flow. Some servers want a
+# final m.login.dummy stage after the token stage, so follow up if asked.
+register_user() { # localpart password
+    local localpart="$1" password="$2" session resp
+    session="$(curl -s -X POST "$HS_URL/_matrix/client/v3/register" \
+        -H 'Content-Type: application/json' -d '{}' | jq -r '.session // empty')"
+    [ -n "$session" ] || die "homeserver did not open a registration session"
+    resp="$(jq -n --arg u "$localpart" --arg p "$password" --arg t "$REG_SECRET" --arg s "$session" \
+        '{username: $u, password: $p, inhibit_login: true,
+          initial_device_display_name: "lily-sandbox",
+          auth: {type: "m.login.registration_token", token: $t, session: $s}}' \
+        | curl -s -X POST "$HS_URL/_matrix/client/v3/register" \
+            -H 'Content-Type: application/json' -d @-)"
+    if jq -e '.completed and (.user_id | not)' >/dev/null 2>&1 <<<"$resp"; then
+        resp="$(jq -n --arg u "$localpart" --arg p "$password" --arg s "$session" \
+            '{username: $u, password: $p, inhibit_login: true,
+              initial_device_display_name: "lily-sandbox",
+              auth: {type: "m.login.dummy", session: $s}}' \
+            | curl -s -X POST "$HS_URL/_matrix/client/v3/register" \
+                -H 'Content-Type: application/json' -d @-)"
+    fi
+    jq -e '.user_id' >/dev/null 2>&1 <<<"$resp" \
+        || die "failed to register @$localpart:$SERVER_NAME — $resp"
+}
 
 CRED_FILE="$SANDBOX_DIR/credentials.env"
 if [ ! -f "$CRED_FILE" ]; then
     log "first run: creating Matrix accounts $OWNER_MXID and $BOT_MXID"
     BOT_PASSWORD="$(gen_secret)"
     OWNER_PASSWORD="$(gen_secret)"
-    "$SYNAPSE/register_new_matrix_user" -u "$OWNER_LOCALPART" -p "$OWNER_PASSWORD" \
-        --admin -k "$REG_SECRET" http://127.0.0.1:8008
-    "$SYNAPSE/register_new_matrix_user" -u "$BOT_LOCALPART" -p "$BOT_PASSWORD" \
-        --no-admin -k "$REG_SECRET" http://127.0.0.1:8008
+    # Owner first: Tuwunel grants server admin to the first registration.
+    register_user "$OWNER_LOCALPART" "$OWNER_PASSWORD"
+    register_user "$BOT_LOCALPART" "$BOT_PASSWORD"
     (
         umask 077
         cat >"$CRED_FILE" <<EOF
@@ -175,7 +180,7 @@ fi
 # shellcheck disable=SC1090
 . "$CRED_FILE"
 
-export MATRIX_HOMESERVER="http://127.0.0.1:8008"
+export MATRIX_HOMESERVER="$HS_URL"
 export MATRIX_USER="$MATRIX_BOT_MXID"
 export MATRIX_PASSWORD="$MATRIX_BOT_PASSWORD"
 export OPENCODE_URL="${OPENCODE_URL:-http://127.0.0.1:4096}"
@@ -226,7 +231,7 @@ cat <<EOF
 
 ==============================================================================
  lily sandbox is up
-   Matrix server   $SERVER_NAME   (federation OFF, registration CLOSED)
+   Matrix server   $SERVER_NAME   (Tuwunel — federation OFF, registration token-gated)
    Allowed driver  $LILY_ALLOWED_USERS
    Your login      $MATRIX_OWNER_MXID
    Your password   $SANDBOX_DIR/credentials.env  (readable from the host)
