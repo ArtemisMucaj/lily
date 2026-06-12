@@ -47,8 +47,11 @@ Python, idles in the tens of megabytes.
 
 - Docker Desktop with [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/)
   and the `sbx` CLI
-- An API key for the model provider opencode should use (e.g.
-  `ANTHROPIC_API_KEY`)
+- Credentials for the model provider opencode should use: either an API key
+  (e.g. `ANTHROPIC_API_KEY` in `config.env`), or log in at boot — when no
+  credentials exist the entrypoint runs `opencode auth login` before starting
+  `opencode serve` (attached sessions get the prompt directly; detached ones
+  wait until you run `sbx exec -it <name> opencode auth login` from the host)
 - Optional: an [ngrok](https://ngrok.com) account for remote access — claim
   your free **static domain** so the homeserver URL survives restarts
 

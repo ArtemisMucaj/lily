@@ -40,6 +40,9 @@ network:
       headerName: x-api-key
       valueFormat: "%s"
   allowedDomains:
+    # `opencode auth login` — Anthropic OAuth authorize/token endpoints.
+    - "claude.ai:443"
+    - "console.anthropic.com:443"
     # ngrok agent control plane and edges (remote Matrix access).
     - "connect.ngrok-agent.com:443"
     - "*.ngrok.com:443"

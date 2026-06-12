@@ -41,7 +41,8 @@ RUN ARCH="$(dpkg --print-architecture)" \
        | tar -xz -C /usr/local/bin ngrok
 
 COPY --from=lily-builder /src/target/release/lily /usr/local/bin/lily
-COPY sandbox/scripts/entrypoint /usr/local/bin/entrypoint
-RUN chmod 0755 /usr/local/bin/lily /usr/local/bin/entrypoint
+COPY sandbox/scripts/ /usr/local/lib/lily-sandbox/
+RUN chmod 0755 /usr/local/bin/lily /usr/local/lib/lily-sandbox/entrypoint \
+    && ln -s /usr/local/lib/lily-sandbox/entrypoint /usr/local/bin/entrypoint
 
 USER agent
