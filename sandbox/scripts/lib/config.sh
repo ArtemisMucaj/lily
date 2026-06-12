@@ -33,14 +33,10 @@ load_config() {
     BOT_MXID="@$BOT_LOCALPART:$SERVER_NAME"
     OWNER_MXID="@$OWNER_LOCALPART:$SERVER_NAME"
 
-    # Matrix data is shared with the host by default. `local` keeps the live
-    # database on the sandbox disk instead — the escape hatch if RocksDB
-    # misbehaves on the passthrough filesystem.
-    case "${LILY_SANDBOX_MATRIX_DATA:-shared}" in
-        shared) MATRIX_DIR="$SANDBOX_DIR/matrix" ;;
-        local) MATRIX_DIR="$HOME/.lily-matrix" ;;
-        *) die "LILY_SANDBOX_MATRIX_DATA must be 'shared' or 'local'" ;;
-    esac
+    # The homeserver database lives on the sandbox disk: RocksDB misbehaves
+    # on the workspace passthrough filesystem, so it cannot sit in the shared
+    # ~/.lily. `sbx rm` wipes it; accounts re-register on the next boot.
+    MATRIX_DIR="$HOME/.lily-matrix"
 
     export OPENCODE_URL="${OPENCODE_URL:-http://127.0.0.1:4096}"
 }

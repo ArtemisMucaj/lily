@@ -29,14 +29,6 @@ mkdir -p ~/.lily/sandbox && mv /tmp/config.env ~/.lily/sandbox/
 sandbox/lilyctl up ~/code/my-project
 ```
 
-## Tuwunel database errors on the shared mount
-
-RocksDB can be picky about locking and mmap on workspace passthrough
-filesystems. Set `LILY_SANDBOX_MATRIX_DATA=local` in `config.env` (then do
-the reset above): the homeserver database moves to the sandbox disk —
-host-invisible, and gone if you `sbx rm` the sandbox, but the entrypoint
-re-registers the accounts from `credentials.env` on the next boot.
-
 ## ngrok can't connect
 
 Sandbox egress runs through a policy proxy; allow the ngrok domains (the kit

@@ -132,11 +132,11 @@ EOF
     # shellcheck disable=SC1090
     . "$CRED_FILE"
 
-    # credentials.env and the database can drift apart — switching
-    # LILY_SANDBOX_MATRIX_DATA points Tuwunel at a fresh database while the
-    # stored passwords survive. Re-register missing accounts with their
-    # stored passwords (an existing account with a wrong password still dies
-    # in register_user, which is the right failure).
+    # credentials.env and the database can drift apart — the database lives
+    # on the sandbox disk, so recreating the sandbox starts it empty while
+    # the stored passwords survive on the shared mount. Re-register missing
+    # accounts with their stored passwords (an existing account with a wrong
+    # password still dies in register_user, which is the right failure).
     if ! can_login "$OWNER_MXID" "$MATRIX_OWNER_PASSWORD"; then
         log "$OWNER_MXID missing from the homeserver — re-registering"
         register_user "$OWNER_LOCALPART" "$MATRIX_OWNER_PASSWORD"

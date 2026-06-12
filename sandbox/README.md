@@ -91,7 +91,6 @@ NGROK_DOMAIN=your-name.ngrok-free.app   # your static domain; strongly recommend
 # LILY_MATRIX_SERVER_NAME=lily.localhost  # immutable after first boot!
 # LILY_OWNER_USER=owner                   # your account's localpart
 # LILY_MATRIX_BOT_USER=lily               # the bot account's localpart
-# LILY_SANDBOX_MATRIX_DATA=shared         # 'local' keeps Matrix DBs on sandbox disk
 # DISCORD_TOKEN=...                       # also enable the Discord connector
 ```
 
@@ -161,7 +160,7 @@ Service logs are shared with the host at `~/.lily/sandbox/logs/`
 | `~/.lily/matrix-store/`, `matrix-session.json` | lily's Matrix client session |
 | `~/.lily/sandbox/config.env` | your settings (host-editable) |
 | `~/.lily/sandbox/credentials.env` | generated account passwords (`0600`) |
-| `~/.lily/sandbox/matrix/` | the homeserver: `tuwunel.toml`, registration token, RocksDB database |
+| `~/.lily-matrix/` (sandbox disk only) | the homeserver: `tuwunel.toml`, registration token, RocksDB database — wiped by `sbx rm`; accounts re-register on the next boot |
 | `~/.lily/sandbox/logs/` | service logs |
 
 ## Troubleshooting
