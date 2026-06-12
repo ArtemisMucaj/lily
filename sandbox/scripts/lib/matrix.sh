@@ -95,10 +95,10 @@ can_login() { # mxid password
     local token
     token="$(jq -n --arg u "$1" --arg p "$2" \
         '{type: "m.login.password", identifier: {type: "m.id.user", user: $u}, password: $p}' \
-        | curl -s -X POST "$HS_URL/_matrix/client/v3/login" -d @- \
+        | curl -s --max-time 10 -X POST "$HS_URL/_matrix/client/v3/login" -d @- \
         | jq -r '.access_token // empty')"
     [ -n "$token" ] || return 1
-    curl -s -o /dev/null -X POST -H "Authorization: Bearer $token" \
+    curl -s --max-time 10 -o /dev/null -X POST -H "Authorization: Bearer $token" \
         "$HS_URL/_matrix/client/v3/logout"
 }
 

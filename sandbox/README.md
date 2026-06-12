@@ -130,7 +130,7 @@ Send a message in the room and the agent goes to work — inside the sandbox.
 
 ```bash
 sandbox/lilyctl status                   # sbx ls
-sandbox/lilyctl down / lilyctl up        # pause / resume (state persists)
+sandbox/lilyctl down / up                # pause / resume (state persists)
 sandbox/lilyctl shell                    # shell into the stack
 sandbox/lilyctl logs opencode            # follow a service log
 sandbox/lilyctl login                    # opencode auth login inside

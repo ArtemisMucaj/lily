@@ -38,14 +38,18 @@ ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 LOG_DIR="${LILY_DATA_DIR:-$HOME/.lily}/sandbox/logs"
 
 # First sandbox running the lily agent (there is normally exactly one).
+# Never fails: a broken `sbx ls` reads as "no sandbox" so callers report it.
 sandbox_name() {
-    sbx ls 2>/dev/null | awk 'NR > 1 && $2 == "lily" { print $1; exit }'
+    sbx ls 2>/dev/null | awk 'NR > 1 && $2 == "lily" { print $1; exit }' || true
 }
 
+# Always assign this to a variable (name="$(require_name)"): in argument
+# position the die exits only the substitution subshell and the outer
+# command would still run with an empty name.
 require_name() {
     local name
     name="$(sandbox_name)"
-    [ -n "$name" ] || die "no lily sandbox found — create one with: sandbox/lilyctl up PROJECT_DIR"
+    [ -n "$name" ] || die "no lily sandbox found (sbx ls) — create one with: sandbox/lilyctl up PROJECT_DIR"
     printf '%s' "$name"
 }
 
@@ -81,7 +85,9 @@ cmd_up() {
 }
 
 cmd_down() {
-    sbx stop "$(require_name)"
+    local name
+    name="$(require_name)"
+    sbx stop "$name"
 }
 
 cmd_status() {
@@ -99,19 +105,24 @@ cmd_shell() {
     if [ $# -eq 0 ]; then
         set -- bash
     fi
-    local tty_flags=()
+    local name tty_flags=()
+    name="$(require_name)"
     if [ -t 0 ]; then
         tty_flags=(-it)
     fi
-    exec sbx exec ${tty_flags[@]+"${tty_flags[@]}"} "$(require_name)" "$@"
+    exec sbx exec ${tty_flags[@]+"${tty_flags[@]}"} "$name" "$@"
 }
 
 cmd_login() {
-    exec sbx exec -it "$(require_name)" opencode auth login
+    local name
+    name="$(require_name)"
+    exec sbx exec -it "$name" opencode auth login
 }
 
 cmd_ports() {
-    exec sbx ports "$(require_name)" --publish 8008:8008
+    local name
+    name="$(require_name)"
+    exec sbx ports "$name" --publish 8008:8008
 }
 
 main() {
