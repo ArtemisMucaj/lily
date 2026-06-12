@@ -20,20 +20,40 @@ die() {
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 
+usage() { printf 'usage: sandbox/up [--build] PROJECT_DIR[:ro] [PROJECT_DIR[:ro]...]\n'; }
+
 build=0
-if [ "${1:-}" = "--build" ]; then
-    build=1
+projects=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --build) build=1 ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        --) # everything after -- is a project path, dashes and all
+            shift
+            projects+=("$@")
+            break
+            ;;
+        -*)
+            usage >&2
+            die "unknown option: $1"
+            ;;
+        *) projects+=("$1") ;;
+    esac
     shift
+done
+if [ ${#projects[@]} -eq 0 ]; then
+    usage >&2
+    exit 1
 fi
-[ $# -ge 1 ] || die "usage: sandbox/up [--build] PROJECT_DIR[:ro] [PROJECT_DIR[:ro]...]"
 
 command -v docker >/dev/null || die "docker not found"
 command -v sbx >/dev/null || die "sbx not found (Docker Sandboxes CLI)"
 
-projects=()
-for p in "$@"; do
+for p in "${projects[@]}"; do
     [ -d "${p%:ro}" ] || die "project directory not found: ${p%:ro}"
-    projects+=("$p")
 done
 
 if [ "$build" = 1 ]; then
