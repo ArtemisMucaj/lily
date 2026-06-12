@@ -4,149 +4,29 @@
 #
 # Boots the full lily experience inside one sandbox microVM:
 #   1. a locked-down Tuwunel Matrix homeserver (no federation, registration
-#      token-gated, data shared with the host under ~/.lily/sandbox/matrix)
-#   2. opencode serve on 127.0.0.1:4096
-#   3. an optional ngrok tunnel for reaching Matrix from outside (only when
-#      NGROK_AUTHTOKEN is set)
+#      token-gated)                                          — lib/matrix.sh
+#   2. opencode serve on 127.0.0.1:4096, behind an auth gate so the operator
+#      can run `opencode auth login` first                   — lib/opencode.sh
+#   3. an optional ngrok tunnel (only when NGROK_AUTHTOKEN is set)
+#                                                            — lib/ngrok.sh
 #   4. lily itself, allowlisted to the owner account only
 #
-# Every service — lily included — is supervised: if it crashes it is
-# restarted with exponential backoff (2s doubling up to 60s; the backoff
-# resets once a run survives for a minute).
+# This file is only the boot order; the steps live in lib/*.sh. Every
+# service — lily included — is supervised (lib/supervise.sh): if it crashes
+# it is restarted with exponential backoff.
 #
 # Host-side settings are read from ~/.lily/sandbox/config.env (the .lily
 # workspace is shared with the host, so edit that file on either side).
 set -euo pipefail
 
-log() { printf '[lily] %s\n' "$*"; }
-die() {
-    log "ERROR: $*" >&2
-    exit 1
-}
-gen_secret() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48; true; }
-# Succeeds once the URL answers any HTTP status (only connection refusal fails).
-wait_http() {
-    local url="$1" tries="${2:-60}" i=0
-    until curl -s -o /dev/null --max-time 2 "$url"; do
-        i=$((i + 1))
-        [ "$i" -ge "$tries" ] && return 1
-        sleep 1
-    done
-}
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+for lib in "$SCRIPT_DIR"/lib/*.sh; do
+    # shellcheck disable=SC1090
+    . "$lib"
+done
 
-# Keep a service alive. Runs in the background; the TERM/INT trap forwards
-# the signal to the current child so shutdown stays clean. The backoff sleep
-# is backgrounded too — bash defers traps while a foreground command runs,
-# and `wait` is the only spot where signals interrupt immediately.
-supervise() { # name logfile cmd...
-    local name="$1" logfile="$2" child=0 delay=2 started rc
-    shift 2
-    trap '[ "$child" != 0 ] && kill "$child" 2>/dev/null; exit 0' TERM INT
-    while :; do
-        started="$(date +%s)"
-        "$@" >>"$logfile" 2>&1 &
-        child=$!
-        rc=0
-        wait "$child" || rc=$?
-        if [ $(($(date +%s) - started)) -ge 60 ]; then
-            delay=2
-        fi
-        log "$name exited (status $rc); restarting in ${delay}s (log: $logfile)"
-        sleep "$delay" &
-        child=$!
-        wait "$child" || true
-        delay=$((delay >= 60 ? 60 : delay * 2))
-    done
-}
+load_config
 
-HS_URL="http://127.0.0.1:8008"
-
-TUWUNEL="$(command -v tuwunel || true)"
-if [ -z "$TUWUNEL" ]; then
-    for p in /usr/sbin/tuwunel /usr/bin/tuwunel /usr/local/bin/tuwunel; do
-        [ -x "$p" ] && TUWUNEL="$p" && break
-    done
-fi
-[ -n "$TUWUNEL" ] || die "tuwunel binary not found"
-
-# ---------------------------------------------------------------------------
-# Locate the data dir. Docker Sandboxes mount workspaces at their host
-# absolute paths, so when the host's ~/.lily is passed as a workspace it shows
-# up as a mount whose path ends in /.lily.
-# ---------------------------------------------------------------------------
-if [ -z "${LILY_DATA_DIR:-}" ]; then
-    mounted="$(awk '$2 ~ /\/\.lily$/ { print $2; exit }' /proc/mounts || true)"
-    LILY_DATA_DIR="${mounted:-$HOME/.lily}"
-fi
-export LILY_DATA_DIR
-SANDBOX_DIR="$LILY_DATA_DIR/sandbox"
-LOG_DIR="$SANDBOX_DIR/logs"
-mkdir -p "$SANDBOX_DIR" "$LOG_DIR"
-chmod 700 "$SANDBOX_DIR"
-log "data dir: $LILY_DATA_DIR"
-
-if [ -f "$SANDBOX_DIR/config.env" ]; then
-    log "loading $SANDBOX_DIR/config.env"
-    set -a
-    # shellcheck disable=SC1091
-    . "$SANDBOX_DIR/config.env"
-    set +a
-fi
-
-SERVER_NAME="${LILY_MATRIX_SERVER_NAME:-lily.localhost}"
-BOT_LOCALPART="${LILY_MATRIX_BOT_USER:-lily}"
-OWNER_LOCALPART="${LILY_OWNER_USER:-owner}"
-BOT_MXID="@$BOT_LOCALPART:$SERVER_NAME"
-OWNER_MXID="@$OWNER_LOCALPART:$SERVER_NAME"
-
-# Matrix data is shared with the host by default. `local` keeps the live
-# database on the sandbox disk instead — the escape hatch if RocksDB
-# misbehaves on the passthrough filesystem.
-case "${LILY_SANDBOX_MATRIX_DATA:-shared}" in
-    shared) MATRIX_DIR="$SANDBOX_DIR/matrix" ;;
-    local) MATRIX_DIR="$HOME/.lily-matrix" ;;
-    *) die "LILY_SANDBOX_MATRIX_DATA must be 'shared' or 'local'" ;;
-esac
-mkdir -p "$MATRIX_DIR/db"
-chmod 700 "$MATRIX_DIR"
-
-# ---------------------------------------------------------------------------
-# Tuwunel configuration, rewritten on every boot so the lockdown cannot
-# drift: federation is disabled entirely and registration only works with the
-# local token, which doubles as the provisioning secret below.
-# ---------------------------------------------------------------------------
-HS_CONFIG="$MATRIX_DIR/tuwunel.toml"
-REG_SECRET_FILE="$MATRIX_DIR/registration.secret"
-
-if [ ! -f "$REG_SECRET_FILE" ]; then
-    (
-        umask 077
-        gen_secret >"$REG_SECRET_FILE"
-    )
-fi
-REG_SECRET="$(cat "$REG_SECRET_FILE")"
-
-(
-    umask 077
-    cat >"$HS_CONFIG" <<EOF
-# Written by the lily sandbox entrypoint on every boot — edits do not persist.
-[global]
-server_name = "$SERVER_NAME"
-database_path = "$MATRIX_DIR/db"
-address = "0.0.0.0"
-port = 8008
-allow_federation = false
-allow_registration = true
-registration_token = "$REG_SECRET"
-trusted_servers = []
-allow_check_for_updates = false
-EOF
-)
-
-# ---------------------------------------------------------------------------
-# Services. Reconnecting to an existing sandbox reruns this entrypoint, so
-# each service is skipped when it already answers.
-# ---------------------------------------------------------------------------
 cleanup() {
     trap - EXIT INT TERM
     log "shutting down"
@@ -157,156 +37,18 @@ trap cleanup EXIT
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
 
-if wait_http "$HS_URL/_matrix/client/versions" 1; then
-    log "Tuwunel already running"
-else
-    log "starting Tuwunel"
-    supervise tuwunel "$LOG_DIR/tuwunel.log" "$TUWUNEL" -c "$HS_CONFIG" &
-    wait_http "$HS_URL/_matrix/client/versions" 90 \
-        || die "Tuwunel did not come up; see $LOG_DIR/tuwunel.log"
-fi
+# Reconnecting to an existing sandbox reruns this entrypoint, so each start_*
+# step is skipped when the service already answers.
+start_matrix
+ensure_matrix_accounts
+start_opencode
+start_ngrok
+write_shell_env
+print_banner
 
-# Register an account through the token-gated UIAA flow. Some servers want a
-# final m.login.dummy stage after the token stage, so follow up if asked.
-register_user() { # localpart password
-    local localpart="$1" password="$2" session resp i=0
-    # Retry the initial probe: /versions can answer before /register is ready.
-    while [ $i -lt 10 ]; do
-        session="$(curl -s -X POST "$HS_URL/_matrix/client/v3/register" \
-            -H 'Content-Type: application/json' -d '{}' | jq -r '.session // empty' || true)"
-        [ -n "$session" ] && break
-        i=$((i + 1))
-        sleep 1
-    done
-    [ -n "$session" ] || die "homeserver did not open a registration session"
-    resp="$(jq -n --arg u "$localpart" --arg p "$password" --arg t "$REG_SECRET" --arg s "$session" \
-        '{username: $u, password: $p, inhibit_login: true,
-          initial_device_display_name: "lily",
-          auth: {type: "m.login.registration_token", token: $t, session: $s}}' \
-        | curl -s -X POST "$HS_URL/_matrix/client/v3/register" \
-            -H 'Content-Type: application/json' -d @-)"
-    if jq -e '.completed and (.user_id | not)' >/dev/null 2>&1 <<<"$resp"; then
-        resp="$(jq -n --arg u "$localpart" --arg p "$password" --arg s "$session" \
-            '{username: $u, password: $p, inhibit_login: true,
-              initial_device_display_name: "lily",
-              auth: {type: "m.login.dummy", session: $s}}' \
-            | curl -s -X POST "$HS_URL/_matrix/client/v3/register" \
-                -H 'Content-Type: application/json' -d @-)"
-    fi
-    jq -e '.user_id' >/dev/null 2>&1 <<<"$resp" \
-        || die "failed to register @$localpart:$SERVER_NAME — $resp"
-}
-
-CRED_FILE="$SANDBOX_DIR/credentials.env"
-if [ ! -f "$CRED_FILE" ]; then
-    log "first run: creating Matrix accounts $OWNER_MXID and $BOT_MXID"
-    BOT_PASSWORD="$(gen_secret)"
-    OWNER_PASSWORD="$(gen_secret)"
-    # Owner first: Tuwunel grants server admin to the first registration.
-    register_user "$OWNER_LOCALPART" "$OWNER_PASSWORD"
-    register_user "$BOT_LOCALPART" "$BOT_PASSWORD"
-    (
-        umask 077
-        cat >"$CRED_FILE" <<EOF
-MATRIX_OWNER_MXID=$OWNER_MXID
-MATRIX_OWNER_PASSWORD=$OWNER_PASSWORD
-MATRIX_BOT_MXID=$BOT_MXID
-MATRIX_BOT_PASSWORD=$BOT_PASSWORD
-EOF
-    )
-fi
-# shellcheck disable=SC1090
-. "$CRED_FILE"
-
-export MATRIX_HOMESERVER="$HS_URL"
-export MATRIX_USER="$MATRIX_BOT_MXID"
-export MATRIX_PASSWORD="$MATRIX_BOT_PASSWORD"
-export OPENCODE_URL="${OPENCODE_URL:-http://127.0.0.1:4096}"
-# Only the owner may drive the bot unless config.env widens this explicitly.
-export LILY_ALLOWED_USERS="${LILY_ALLOWED_USERS:-$MATRIX_OWNER_MXID}"
-
-if wait_http "$OPENCODE_URL" 1; then
-    log "opencode already running"
-else
-    log "starting opencode serve"
-    supervise opencode "$LOG_DIR/opencode.log" \
-        opencode serve --hostname 127.0.0.1 --port 4096 &
-    wait_http "$OPENCODE_URL" 60 \
-        || die "opencode serve did not come up; see $LOG_DIR/opencode.log"
-fi
-
-NGROK_URL=""
-if [ -n "${NGROK_AUTHTOKEN:-}" ]; then
-    if wait_http "http://127.0.0.1:4040/api/tunnels" 1; then
-        log "ngrok already running"
-    else
-        log "starting ngrok tunnel"
-        ngrok_args=(http 8008 --log stdout)
-        [ -n "${NGROK_DOMAIN:-}" ] && ngrok_args+=(--url "https://$NGROK_DOMAIN")
-        supervise ngrok "$LOG_DIR/ngrok.log" ngrok "${ngrok_args[@]}" &
-    fi
-    for _ in $(seq 1 30); do
-        NGROK_URL="$(curl -s --max-time 2 http://127.0.0.1:4040/api/tunnels 2>/dev/null \
-            | jq -r '.tunnels[0].public_url // empty')"
-        [ -n "$NGROK_URL" ] && break
-        sleep 1
-    done
-    [ -n "$NGROK_URL" ] || log "WARNING: no ngrok tunnel URL yet; see $LOG_DIR/ngrok.log"
-else
-    log "NGROK_AUTHTOKEN not set — skipping remote tunnel (local access only)"
-fi
-
-# Make `sbx exec -it <name> bash` shells pick up the stack's environment so
-# the lily CLI (project/task/send) works against the right data dir.
-(
-    umask 077
-    cat >"$HOME/.lily-env" <<EOF
-export LILY_DATA_DIR="$LILY_DATA_DIR"
-export OPENCODE_URL="$OPENCODE_URL"
-export MATRIX_HOMESERVER="$MATRIX_HOMESERVER"
-EOF
-)
-if ! grep -qs 'lily-env' "$HOME/.bashrc"; then
-    printf '\n[ -f "$HOME/.lily-env" ] && . "$HOME/.lily-env"\n' \
-        >>"$HOME/.bashrc"
-fi
-
-cat <<EOF
-
-==============================================================================
- lily sandbox is up
-   Matrix server   $SERVER_NAME   (Tuwunel — federation OFF, registration token-gated)
-   Allowed driver  $LILY_ALLOWED_USERS
-   Your login      $MATRIX_OWNER_MXID
-   Your password   $SANDBOX_DIR/credentials.env  (readable from the host)
-   Bot account     $BOT_MXID
-   Remote URL      ${NGROK_URL:-— (set NGROK_AUTHTOKEN in config.env to enable)}
-
- Connect a Matrix client:
-   local:  on the host run    sbx ports <sandbox-name> --publish 8008:8008
-           then use http://localhost:8008 as the homeserver URL
-   remote: use ${NGROK_URL:-the ngrok URL} as the homeserver URL
-   log in as $MATRIX_OWNER_MXID, create a room, invite $BOT_MXID
-   (it auto-joins), then link a mounted project: !add-project /abs/path
-==============================================================================
-
-EOF
-
-# lily's output stays attached to the agent session; it runs as a waited-on
-# background child (not foreground) so TERM/INT interrupt the `wait` and the
-# cleanup trap fires immediately instead of after lily exits.
-delay=2
-while :; do
-    started="$(date +%s)"
-    log "starting lily"
-    lily run >>"$LOG_DIR/lily.log" 2>&1 &
-    rc=0
-    wait $! || rc=$?
-    if [ $(($(date +%s) - started)) -ge 60 ]; then
-        delay=2
-    fi
-    log "lily exited (status $rc); restarting in ${delay}s"
-    sleep "$delay" &
-    wait $! || true
-    delay=$((delay >= 60 ? 60 : delay * 2))
-done
+# lily's output stays attached to the agent session; the supervisor runs as a
+# waited-on background child (not foreground) so TERM/INT interrupt the
+# `wait` and the cleanup trap fires immediately instead of after lily exits.
+log "starting lily"
+supervise lily "$LOG_DIR/lily.log" lily run &
+wait $!

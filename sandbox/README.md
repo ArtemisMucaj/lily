@@ -47,12 +47,26 @@ Python, idles in the tens of megabytes.
 
 - Docker Desktop with [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/)
   and the `sbx` CLI
-- An API key for the model provider opencode should use (e.g.
-  `ANTHROPIC_API_KEY`)
+- Credentials for the model provider opencode should use: either an API key
+  (e.g. `ANTHROPIC_API_KEY` in `config.env`), or log in at boot — when no
+  credentials exist the entrypoint runs `opencode auth login` before starting
+  `opencode serve` (attached sessions get the prompt directly; detached ones
+  wait until you run `sbx exec -it <name> opencode auth login` from the host)
 - Optional: an [ngrok](https://ngrok.com) account for remote access — claim
   your free **static domain** so the homeserver URL survives restarts
 
 ## Setup
+
+The short version — [`sandbox/lilyctl`](lilyctl) wraps the whole lifecycle
+(configure first, see step 2):
+
+```bash
+sandbox/lilyctl build                  # bake + load the template image
+sandbox/lilyctl up ~/code/my-project   # create and run the sandbox
+sandbox/lilyctl up                     # later: resume it
+```
+
+The same thing step by step:
 
 **1. Build the template image** (from the repository root):
 
@@ -77,7 +91,6 @@ NGROK_DOMAIN=your-name.ngrok-free.app   # your static domain; strongly recommend
 # LILY_MATRIX_SERVER_NAME=lily.localhost  # immutable after first boot!
 # LILY_OWNER_USER=owner                   # your account's localpart
 # LILY_MATRIX_BOT_USER=lily               # the bot account's localpart
-# LILY_SANDBOX_MATRIX_DATA=shared         # 'local' keeps Matrix DBs on sandbox disk
 # DISCORD_TOKEN=...                       # also enable the Discord connector
 ```
 
@@ -115,16 +128,19 @@ Send a message in the room and the agent goes to work — inside the sandbox.
 ## Day-to-day
 
 ```bash
-sbx ls                                   # status
-sbx stop lily-... / sbx run ...          # pause / resume (state persists)
-sbx exec -it <name> bash                 # shell into the stack
+sandbox/lilyctl status                   # sbx ls
+sandbox/lilyctl down / up                # pause / resume (state persists)
+sandbox/lilyctl shell                    # shell into the stack
+sandbox/lilyctl logs opencode            # follow a service log
+sandbox/lilyctl login                    # opencode auth login inside
+sandbox/lilyctl ports                    # publish Matrix 8008 on localhost
 ```
 
 Interactive shells inherit the stack's environment (data dir, opencode URL),
 so the lily CLI works directly:
 
 ```bash
-sbx exec -it <name> bash
+sandbox/lilyctl shell
 lily project list
 lily send --channel <room-id> --prompt "daily report" --send-at "0 9 * * 1-5"
 ```
@@ -144,7 +160,7 @@ Service logs are shared with the host at `~/.lily/sandbox/logs/`
 | `~/.lily/matrix-store/`, `matrix-session.json` | lily's Matrix client session |
 | `~/.lily/sandbox/config.env` | your settings (host-editable) |
 | `~/.lily/sandbox/credentials.env` | generated account passwords (`0600`) |
-| `~/.lily/sandbox/matrix/` | the homeserver: `tuwunel.toml`, registration token, RocksDB database |
+| `~/.lily-matrix/` (sandbox disk only) | the homeserver: `tuwunel.toml`, registration token, RocksDB database — wiped by `sbx rm`; accounts re-register on the next boot |
 | `~/.lily/sandbox/logs/` | service logs |
 
 ## Troubleshooting

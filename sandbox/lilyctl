@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# lilyctl — one command for the lily Docker Sandbox stack: build the template
+# image, create or resume the sandbox, and poke at it while it runs.
+# See sandbox/README.md for the full setup.
+#
+#   sandbox/lilyctl build                          # first time: bake the image
+#   sandbox/lilyctl up ~/code/my-project           # create the sandbox
+#   sandbox/lilyctl up                             # resume the existing sandbox
+#   sandbox/lilyctl logs opencode                  # follow a service log
+#   sandbox/lilyctl shell                          # shell into the microVM
+set -euo pipefail
+
+log() { printf '[lily] %s\n' "$*"; }
+die() {
+    log "ERROR: $*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+usage: sandbox/lilyctl <command> [args]
+
+  build                               build and load the template image
+  up [PROJECT_DIR[:ro]...]            create the sandbox (or resume it when no
+                                      projects are given)
+  down                                stop the sandbox (state persists)
+  status|ps                           list sandboxes
+  logs [SERVICE]                      follow a service log (lily, opencode,
+                                      tuwunel, ngrok; default lily)
+  shell|exec [CMD...]                 interactive shell (or command) inside
+  login                               run 'opencode auth login' inside
+  ports                               publish Matrix (8008) on localhost
+  help                                show this help
+EOF
+}
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+LOG_DIR="${LILY_DATA_DIR:-$HOME/.lily}/sandbox/logs"
+
+# First sandbox running the lily agent (there is normally exactly one).
+# Never fails: a broken `sbx ls` reads as "no sandbox" so callers report it.
+sandbox_name() {
+    sbx ls 2>/dev/null | awk 'NR > 1 && $2 == "lily" { print $1; exit }' || true
+}
+
+# Always assign this to a variable (name="$(require_name)"): in argument
+# position the die exits only the substitution subshell and the outer
+# command would still run with an empty name.
+require_name() {
+    local name
+    name="$(sandbox_name)"
+    [ -n "$name" ] || die "no lily sandbox found (sbx ls) — create one with: sandbox/lilyctl up PROJECT_DIR"
+    printf '%s' "$name"
+}
+
+build_template() {
+    command -v docker >/dev/null || die "docker not found"
+    log "building lily:latest from $ROOT"
+    docker build -f "$ROOT/sandbox/Dockerfile" -t lily:latest "$ROOT"
+    local tmp
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" EXIT
+    log "loading the image into Docker Sandboxes"
+    docker image save lily:latest -o "$tmp/lily.tar"
+    sbx template load "$tmp/lily.tar"
+    rm -rf "$tmp"
+    trap - EXIT
+}
+
+cmd_up() {
+    local p
+    for p in "$@"; do
+        [ -d "${p%:ro}" ] || die "project directory not found: ${p%:ro}"
+    done
+    if [ $# -eq 0 ]; then
+        local name
+        name="$(sandbox_name)"
+        [ -n "$name" ] || die "no lily sandbox to resume — pass at least one PROJECT_DIR"
+        log "resuming sandbox $name"
+        exec sbx run --kit "$ROOT/sandbox/kit" "$name"
+    fi
+    mkdir -p "$HOME/.lily"
+    log "starting the lily sandbox"
+    exec sbx run --kit "$ROOT/sandbox/kit" lily "$@" "$HOME/.lily"
+}
+
+cmd_down() {
+    local name
+    name="$(require_name)"
+    sbx stop "$name"
+}
+
+cmd_status() {
+    sbx ls
+}
+
+cmd_logs() {
+    local service="${1:-lily}" file
+    file="$LOG_DIR/$service.log"
+    [ -f "$file" ] || die "no log at $file (services: lily, opencode, tuwunel, ngrok)"
+    exec tail -n 50 -f "$file"
+}
+
+cmd_shell() {
+    if [ $# -eq 0 ]; then
+        set -- bash
+    fi
+    local name tty_flags=()
+    name="$(require_name)"
+    if [ -t 0 ]; then
+        tty_flags=(-it)
+    fi
+    exec sbx exec ${tty_flags[@]+"${tty_flags[@]}"} "$name" "$@"
+}
+
+cmd_login() {
+    local name
+    name="$(require_name)"
+    exec sbx exec -it "$name" opencode auth login
+}
+
+cmd_ports() {
+    local name
+    name="$(require_name)"
+    exec sbx ports "$name" --publish 8008:8008
+}
+
+main() {
+    command -v sbx >/dev/null || die "sbx not found (Docker Sandboxes CLI)"
+    case "${1:-}" in
+        up)
+            shift
+            cmd_up "$@"
+            ;;
+        build)
+            build_template
+            ;;
+        down)
+            cmd_down
+            ;;
+        status | ps)
+            cmd_status
+            ;;
+        logs)
+            shift
+            cmd_logs "$@"
+            ;;
+        shell | exec)
+            shift
+            cmd_shell "$@"
+            ;;
+        login)
+            cmd_login
+            ;;
+        ports)
+            cmd_ports
+            ;;
+        -h | --help | help | "")
+            usage
+            ;;
+        *)
+            log "ERROR: unknown command: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
