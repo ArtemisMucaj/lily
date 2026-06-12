@@ -118,6 +118,10 @@ Log level is controlled via `RUST_LOG` (default: `info,serenity=warn`).
 
 `connector::sqlite::Db` stores: channel↔directory mappings, thread↔session id bindings, worktree state (pending/ready/merged), and scheduled tasks. The DB uses WAL journaling. Schema is created via `CREATE TABLE IF NOT EXISTS` on `Db::open`.
 
+## Commit style
+
+Follow [Conventional Commits](https://www.conventionalcommits.org/): `type(scope): description`. Common types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`.
+
 ## Testing patterns
 
 - Domain tests are inline `#[test]` modules (pure, no I/O)
