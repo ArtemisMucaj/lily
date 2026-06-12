@@ -57,15 +57,13 @@ Both connectors can run simultaneously — set both sets of variables to serve D
 
 ### Docker Sandbox (all-in-one)
 
-Run the whole stack — a private Matrix homeserver (federation off, registration closed), `opencode serve`, an optional ngrok tunnel for remote access, and lily — inside a single [Docker Sandbox](https://docs.docker.com/ai/sandboxes/) microVM, with Matrix data shared back to the host under `~/.lily`:
-
-```bash
-docker build -f sandbox/Dockerfile -t lily-sandbox:latest .
-docker image save lily-sandbox:latest -o lily-sandbox.tar && sbx template load lily-sandbox.tar
-sbx run --kit ./sandbox/kit lily ~/code/my-project ~/.lily
-```
-
-The agent can only touch the folders you mount. See [sandbox/README.md](sandbox/README.md) for setup, the security model, and troubleshooting.
+Prefer not to run agents directly on your machine? The whole stack — a
+private Matrix homeserver (federation off, registration closed), `opencode
+serve`, an optional ngrok tunnel for remote access, and lily — can run inside
+a single [Docker Sandbox](https://docs.docker.com/ai/sandboxes/) microVM
+where the agent can only touch the project folders you mount, with Matrix
+data shared back to the host under `~/.lily`. See the dedicated
+[sandbox documentation](sandbox/README.md).
 
 ### Discord
 

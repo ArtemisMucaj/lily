@@ -118,9 +118,20 @@ Send a message in the room and the agent goes to work — inside the sandbox.
 sbx ls                                   # status
 sbx stop lily-... / sbx run ...          # pause / resume (state persists)
 sbx exec -it <name> bash                 # shell into the stack
-sbx exec -it <name> lilyctl project list # lily CLI with the stack's env
-sbx exec -it <name> lilyctl send --channel <room-id> --prompt "daily report" --send-at "0 9 * * 1-5"
 ```
+
+Interactive shells inherit the stack's environment (data dir, opencode URL),
+so the lily CLI works directly:
+
+```bash
+sbx exec -it <name> bash
+lily project list
+lily send --channel <room-id> --prompt "daily report" --send-at "0 9 * * 1-5"
+```
+
+If a service crashes, the entrypoint restarts it automatically with
+exponential backoff (2s doubling up to 60s, reset after a healthy minute) —
+this covers Tuwunel, opencode, ngrok, and lily itself.
 
 Service logs are shared with the host at `~/.lily/sandbox/logs/`
 (`tuwunel.log`, `opencode.log`, `ngrok.log`).
@@ -138,17 +149,7 @@ Service logs are shared with the host at `~/.lily/sandbox/logs/`
 
 ## Troubleshooting
 
-- **Tuwunel won't start / database errors on the shared mount.** RocksDB can
-  be picky about locking and mmap on workspace passthrough filesystems. Set
-  `LILY_SANDBOX_MATRIX_DATA=local` in `config.env` and remove
-  `~/.lily/sandbox/matrix` + `credentials.env`; the homeserver then lives on
-  the sandbox disk (still persistent, just not host-visible).
-- **ngrok can't connect.** Sandbox egress runs through a policy proxy; allow
-  the ngrok domains (the kit declares them) or relax the sandbox's network
-  policy in the `sbx` dashboard.
-- **Changing `server_name`.** Matrix bakes the server name into every user
-  id; it cannot change after first boot. To start over, delete
-  `~/.lily/sandbox/matrix/` and `~/.lily/sandbox/credentials.env` (and
-  `~/.lily/matrix-store/` + `matrix-session.json` so the bot re-logs-in).
-- **Full reset.** `sbx rm <name>` and delete the paths above; project folders
-  and the rest of `~/.lily` are untouched.
+See [TROUBLESHOOTING.md](TROUBLESHOOTING.md): crash-looping services,
+RocksDB on the shared mount, ngrok egress, changing `server_name`, and how
+to do a full reset.
+
