@@ -55,6 +55,16 @@ Both connectors can run simultaneously — set both sets of variables to serve D
 
 > **Security note:** lily runs agents on the host machine. For private setups, set `LILY_ALLOWED_USERS` to your own user id so no one else can start sessions.
 
+### Docker Sandbox (all-in-one)
+
+Prefer not to run agents directly on your machine? The whole stack — a
+private Matrix homeserver (federation off, registration closed), `opencode
+serve`, an optional ngrok tunnel for remote access, and lily — can run inside
+a single [Docker Sandbox](https://docs.docker.com/ai/sandboxes/) microVM
+where the agent can only touch the project folders you mount, with Matrix
+data shared back to the host under `~/.lily`. See the dedicated
+[sandbox documentation](sandbox/README.md).
+
 ### Discord
 
 1. Create a bot at [discord.com/developers](https://discord.com/developers/applications), enable the **Message Content** intent, and invite it to your server with the `bot` and `applications.commands` scopes (permissions needed: Send Messages, Create Public Threads, Manage Threads).
