@@ -57,11 +57,12 @@ Python, idles in the tens of megabytes.
 
 ## Setup
 
-The short version — [`sandbox/up`](up) builds the image, loads the template,
-and runs the stack in one go (configure first, see step 2):
+The short version — [`sandbox/lilyctl`](lilyctl) wraps the whole lifecycle
+(configure first, see step 2):
 
 ```bash
-sandbox/up --build ~/code/my-project    # drop --build once the template is loaded
+sandbox/lilyctl up --build ~/code/my-project   # build, load, run
+sandbox/lilyctl up                             # later: resume the sandbox
 ```
 
 The same thing step by step:
@@ -127,16 +128,19 @@ Send a message in the room and the agent goes to work — inside the sandbox.
 ## Day-to-day
 
 ```bash
-sbx ls                                   # status
-sbx stop lily-... / sbx run ...          # pause / resume (state persists)
-sbx exec -it <name> bash                 # shell into the stack
+sandbox/lilyctl status                   # sbx ls
+sandbox/lilyctl down / lilyctl up        # pause / resume (state persists)
+sandbox/lilyctl shell                    # shell into the stack
+sandbox/lilyctl logs opencode            # follow a service log
+sandbox/lilyctl login                    # opencode auth login inside
+sandbox/lilyctl ports                    # publish Matrix 8008 on localhost
 ```
 
 Interactive shells inherit the stack's environment (data dir, opencode URL),
 so the lily CLI works directly:
 
 ```bash
-sbx exec -it <name> bash
+sandbox/lilyctl shell
 lily project list
 lily send --channel <room-id> --prompt "daily report" --send-at "0 9 * * 1-5"
 ```

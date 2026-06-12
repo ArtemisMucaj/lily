@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# lilyctl — one command for the lily Docker Sandbox stack: build the template
+# image, create or resume the sandbox, and poke at it while it runs.
+# See sandbox/README.md for the full setup.
+#
+#   sandbox/lilyctl up --build ~/code/my-project   # first time
+#   sandbox/lilyctl up                             # resume the existing sandbox
+#   sandbox/lilyctl logs opencode                  # follow a service log
+#   sandbox/lilyctl shell                          # shell into the microVM
+set -euo pipefail
+
+log() { printf '[lily] %s\n' "$*"; }
+die() {
+    log "ERROR: $*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+usage: sandbox/lilyctl <command> [args]
+
+  up [--build] [PROJECT_DIR[:ro]...]  create the sandbox (or resume it when no
+                                      projects are given); --build refreshes
+                                      the template image first
+  build                               build and load the template image only
+  down                                stop the sandbox (state persists)
+  status|ps                           list sandboxes
+  logs [SERVICE]                      follow a service log (lily, opencode,
+                                      tuwunel, ngrok; default lily)
+  shell|exec [CMD...]                 interactive shell (or command) inside
+  login                               run 'opencode auth login' inside
+  ports                               publish Matrix (8008) on localhost
+  help                                show this help
+EOF
+}
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+LOG_DIR="${LILY_DATA_DIR:-$HOME/.lily}/sandbox/logs"
+
+# First sandbox running the lily agent (there is normally exactly one).
+sandbox_name() {
+    sbx ls 2>/dev/null | awk 'NR > 1 && $2 == "lily" { print $1; exit }'
+}
+
+require_name() {
+    local name
+    name="$(sandbox_name)"
+    [ -n "$name" ] || die "no lily sandbox found — create one with: sandbox/lilyctl up PROJECT_DIR"
+    printf '%s' "$name"
+}
+
+build_template() {
+    command -v docker >/dev/null || die "docker not found"
+    log "building lily:latest from $ROOT"
+    docker build -f "$ROOT/sandbox/Dockerfile" -t lily:latest "$ROOT"
+    local tmp
+    tmp="$(mktemp -d)"
+    # Clean up explicitly too: cmd_up execs, which skips EXIT traps.
+    trap "rm -rf '$tmp'" EXIT
+    log "loading the image into Docker Sandboxes"
+    docker image save lily:latest -o "$tmp/lily.tar"
+    sbx template load "$tmp/lily.tar"
+    rm -rf "$tmp"
+    trap - EXIT
+}
+
+cmd_up() {
+    local build=0 p
+    local projects=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --build) build=1 ;;
+            --) # everything after -- is a project path, dashes and all
+                shift
+                projects+=("$@")
+                break
+                ;;
+            -*)
+                usage >&2
+                die "unknown option: $1"
+                ;;
+            *) projects+=("$1") ;;
+        esac
+        shift
+    done
+    for p in ${projects[@]+"${projects[@]}"}; do
+        [ -d "${p%:ro}" ] || die "project directory not found: ${p%:ro}"
+    done
+
+    if [ "$build" = 1 ]; then
+        build_template
+    fi
+
+    if [ ${#projects[@]} -eq 0 ]; then
+        local name
+        name="$(sandbox_name)"
+        [ -n "$name" ] || die "no lily sandbox to resume — pass at least one PROJECT_DIR"
+        log "resuming sandbox $name"
+        exec sbx run --kit "$ROOT/sandbox/kit" "$name"
+    fi
+    mkdir -p "$HOME/.lily"
+    log "starting the lily sandbox"
+    exec sbx run --kit "$ROOT/sandbox/kit" lily "${projects[@]}" "$HOME/.lily"
+}
+
+cmd_down() {
+    sbx stop "$(require_name)"
+}
+
+cmd_status() {
+    sbx ls
+}
+
+cmd_logs() {
+    local service="${1:-lily}" file
+    file="$LOG_DIR/$service.log"
+    [ -f "$file" ] || die "no log at $file (services: lily, opencode, tuwunel, ngrok)"
+    exec tail -n 50 -f "$file"
+}
+
+cmd_shell() {
+    if [ $# -eq 0 ]; then
+        set -- bash
+    fi
+    local tty_flags=()
+    if [ -t 0 ]; then
+        tty_flags=(-it)
+    fi
+    exec sbx exec ${tty_flags[@]+"${tty_flags[@]}"} "$(require_name)" "$@"
+}
+
+cmd_login() {
+    exec sbx exec -it "$(require_name)" opencode auth login
+}
+
+cmd_ports() {
+    exec sbx ports "$(require_name)" --publish 8008:8008
+}
+
+main() {
+    command -v sbx >/dev/null || die "sbx not found (Docker Sandboxes CLI)"
+    case "${1:-}" in
+        up)
+            shift
+            cmd_up "$@"
+            ;;
+        build)
+            build_template
+            ;;
+        down)
+            cmd_down
+            ;;
+        status | ps)
+            cmd_status
+            ;;
+        logs)
+            shift
+            cmd_logs "$@"
+            ;;
+        shell | exec)
+            shift
+            cmd_shell "$@"
+            ;;
+        login)
+            cmd_login
+            ;;
+        ports)
+            cmd_ports
+            ;;
+        -h | --help | help | "")
+            usage
+            ;;
+        *)
+            log "ERROR: unknown command: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
