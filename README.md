@@ -53,34 +53,54 @@ All configuration is via environment variables:
 
 Both connectors can run simultaneously — set both sets of variables to serve Discord and Matrix from a single process.
 
-> **Security note:** lily runs agents on the host machine. On Discord, the sensitive commands (`/add-project`, `/worktree`, `/delete-task`) require the **Manage Guild** permission by default; adjust per command in server settings. For private setups, set `LILY_ALLOWED_USERS` to your own user id so no one else can start sessions.
+> **Security note:** lily runs agents on the host machine. For private setups, set `LILY_ALLOWED_USERS` to your own user id so no one else can start sessions.
 
 ### Discord
 
 1. Create a bot at [discord.com/developers](https://discord.com/developers/applications), enable the **Message Content** intent, and invite it to your server with the `bot` and `applications.commands` scopes (permissions needed: Send Messages, Create Public Threads, Manage Threads).
+
 2. Set `DISCORD_TOKEN` and start lily:
 
-```bash
-export DISCORD_TOKEN=your-bot-token
-cargo run --release -- run
-```
+   ```bash
+   export DISCORD_TOKEN=your-bot-token
+   cargo run --release -- run
+   ```
 
-3. In a channel, run `/add-project directory:/code/web-app` (or `lily project add /code/web-app --channel <channel-id>` from the CLI).
+3. In a channel, link it to a project directory using the slash command:
+
+   ```
+   /add-project directory:/code/web-app
+   ```
+
+   Or from the CLI:
+
+   ```bash
+   lily project add /code/web-app --channel <channel-id>
+   ```
+
 4. Send a message in the channel — lily creates a thread, starts a session in the linked directory, and the agent replies in the thread.
+
+> The commands `/add-project`, `/worktree`, and `/delete-task` require the **Manage Guild** permission by default. Adjust per-command in Server Settings → Integrations.
 
 ### Matrix
 
 1. Set the Matrix env vars and start lily:
 
-```bash
-export MATRIX_HOMESERVER=https://matrix.example.org
-export MATRIX_USER=lily
-export MATRIX_PASSWORD=secret
-cargo run --release -- run
-```
+   ```bash
+   export MATRIX_HOMESERVER=https://matrix.example.org
+   export MATRIX_USER=lily
+   export MATRIX_PASSWORD=secret
+   cargo run --release -- run
+   ```
 
 2. Invite the bot account to a room. lily auto-joins on invite.
-3. In the room, send `!add-project /code/web-app` to link it to a project directory.
+
+3. In the room, link it to a project directory:
+
+   ```
+   !add-project /code/web-app
+   ```
+
 4. Send a message in the room — lily starts a Matrix thread off that message and the agent replies there.
 
 The login session persists to `~/.lily/matrix-session.json`; lily reuses it on restart without re-authenticating.
@@ -107,18 +127,43 @@ sequenceDiagram
 
 ### Queue
 
-Send a message **after** the current run finishes instead of interrupting it by appending `. queue` (or `! queue`, `\nqueue`) to your message, or by using the `/queue` command. The suffix is stripped before the prompt reaches the agent.
+Send a message **after** the current run finishes instead of interrupting it. Use the `/queue` command, or end your message with a queue suffix:
+
+```
+fix the tests. queue
+commit it! queue
+```
+
+Or put `queue` on its own final line:
+
+```
+add error handling
+queue
+```
+
+The suffix is stripped before the prompt reaches the agent.
 
 - If the session is busy, you get the queue position back.
-- **Edit** the queued message to update the prompt in place; remove the `queue` suffix to drop it from the queue.
+- **Edit** the queued message to update the prompt in place; remove the `queue` suffix to drop it from the queue entirely.
 - When a queued message dispatches after waiting, it is shown as `» user: <prompt>`.
 - `/clear [position]` clears all queued messages, or one by position.
 
 ### btw (side questions)
 
-Ask a side question without pausing the running task. Append `. btw` (or `\nbtw`) to a message, or use `/btw <prompt>`. lily **forks the full session context** into a new `btw: <prompt>` thread and dispatches the question there immediately — the original thread is never paused.
+Ask a side question without pausing the running task. Use `/btw <prompt>`, or end a message with a btw suffix:
 
-Unlike `queue`, the `btw` suffix requires punctuation or a newline before it (`btw fix this` is not treated as btw).
+```
+why did you pick sqlite? btw
+```
+
+Or on its own line:
+
+```
+does this approach handle concurrent writes
+btw
+```
+
+lily **forks the full session context** into a new `btw: <prompt>` thread and dispatches the question there immediately — the original thread is never paused. Unlike `queue`, the `btw` suffix requires punctuation or a newline before it (`btw fix this` is not treated as btw).
 
 ```mermaid
 flowchart LR
@@ -155,7 +200,15 @@ lily send --channel <id> --prompt 'Rotate the staging API key' \
 lily send --thread <id> --prompt 'Check the deploy status' --send-at '@hourly'
 ```
 
-Manage tasks from the CLI (`lily task list`, `lily task edit <id>`, `lily task delete <id>`) or from chat (`/tasks`, `/delete-task <id>`). Without `--send-at`, `lily send` fires the prompt on the bot's next scheduler tick (~30 s). The scheduler recovers tasks stranded in `running` after a crash and reschedules recurring tasks after each run.
+Manage tasks from the CLI:
+
+```bash
+lily task list [--all]
+lily task edit <id> [--prompt "..."] [--send-at "..."]
+lily task delete <id>
+```
+
+Or from chat with `/tasks` and `/delete-task <id>`. Without `--send-at`, `lily send` fires the prompt on the bot's next scheduler tick (~30 s). The scheduler recovers tasks stranded in `running` after a crash and reschedules recurring tasks after each run.
 
 ## Commands
 
