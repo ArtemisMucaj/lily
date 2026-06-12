@@ -185,6 +185,7 @@ pub async fn run(state: Arc<AppState>, client: Client) -> Result<()> {
     client.add_event_handler(
         |ev: OriginalSyncRoomMessageEvent, room: Room, client: Client, ctx: Ctx<Arc<AppState>>| async move {
             if room.state() != RoomState::Joined {
+                tracing::debug!("ignoring message in non-joined room {}", room.room_id());
                 return;
             }
             if client.user_id().map(|u| u == ev.sender) == Some(true) {
@@ -192,8 +193,10 @@ pub async fn run(state: Arc<AppState>, client: Client) -> Result<()> {
             }
             let state = ctx.0;
             if !state.config.is_user_allowed(ev.sender.as_str()) {
+                tracing::warn!("ignoring message from disallowed user {}", ev.sender);
                 return;
             }
+            tracing::debug!("received message from {} in {}", ev.sender, room.room_id());
             let chat: Arc<dyn ChatConnector> = Arc::new(MatrixChat { client });
             if let Err(err) = handle_message(&state, &chat, &room, &ev).await {
                 tracing::warn!("matrix message handling failed: {err:#}");
@@ -240,15 +243,23 @@ async fn handle_message(
         }
         // Message inside a thread: continue that session.
         Some(Relation::Thread(thread)) => {
-            let MessageType::Text(text) = &ev.content.msgtype else { return Ok(()) };
+            let MessageType::Text(text) = &ev.content.msgtype else {
+                tracing::debug!("ignoring non-text thread message from {sender}");
+                return Ok(());
+            };
             let thread_id = make_thread_id(room.room_id(), &thread.event_id);
+            tracing::info!("thread message from {sender} in {thread_id}");
             handle_thread_message(state, chat, &room_id, &thread_id, &text.body, &sender, &username, ev.event_id.as_ref())
                 .await
         }
         // Room-level message: a command, or the start of a new session.
         _ => {
-            let MessageType::Text(text) = &ev.content.msgtype else { return Ok(()) };
+            let MessageType::Text(text) = &ev.content.msgtype else {
+                tracing::debug!("ignoring non-text message from {sender} in {room_id}");
+                return Ok(());
+            };
             if let Some(rest) = text.body.strip_prefix('!') {
+                tracing::info!("command from {sender} in {room_id}: !{rest}");
                 let reply =
                     handle_command(state, chat, &room_id, None, rest, &sender, &username).await?;
                 chat.send_message(&room_id, &reply).await?;
@@ -256,10 +267,12 @@ async fn handle_message(
             }
             // Only linked rooms start sessions; stay quiet elsewhere.
             if state.db.get_channel_directory(&room_id)?.is_none() {
+                tracing::debug!("ignoring message in unlinked room {room_id} — use !add-project to link it");
                 return Ok(());
             }
             let directory = state.db.get_channel_directory(&room_id)?.unwrap();
             let parsed = delivery::parse_message(&text.body);
+            tracing::info!("new session from {sender} in {room_id} → {directory}");
             // The user's message becomes the thread root, like Discord's
             // create-thread-from-message.
             let thread_id = make_thread_id(room.room_id(), &ev.event_id.to_owned());
@@ -380,7 +393,9 @@ async fn handle_command(
             if args.is_empty() {
                 return Err(anyhow!("usage: !add-project /absolute/path"));
             }
-            commands::add_project(state, room_id, args)
+            let reply = commands::add_project(state, room_id, args)?;
+            tracing::info!("add-project by {sender}: {args} → {reply}");
+            Ok(reply)
         }
         "queue" => {
             if args.is_empty() {

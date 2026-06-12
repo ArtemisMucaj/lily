@@ -15,7 +15,7 @@ description: >
 agent:
   # Built from sandbox/Dockerfile; load it with `sbx template load` or push it
   # to a registry and update this reference.
-  image: "lily-sandbox:latest"
+  image: "lily:latest"
   persistence: persistent
   entrypoint:
     run: [entrypoint]

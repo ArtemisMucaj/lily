@@ -57,9 +57,9 @@ Python, idles in the tens of megabytes.
 **1. Build the template image** (from the repository root):
 
 ```bash
-docker build -f sandbox/Dockerfile -t lily-sandbox:latest .
-docker image save lily-sandbox:latest -o lily-sandbox.tar
-sbx template load lily-sandbox.tar
+docker build -f sandbox/Dockerfile -t lily:latest .
+docker image save lily:latest -o lily.tar
+sbx template load lily.tar
 ```
 
 **2. Configure** — create `~/.lily/sandbox/config.env` on the host

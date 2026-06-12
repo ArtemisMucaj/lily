@@ -18,12 +18,12 @@
 # workspace is shared with the host, so edit that file on either side).
 set -euo pipefail
 
-log() { printf '[lily-sandbox] %s\n' "$*"; }
+log() { printf '[lily] %s\n' "$*"; }
 die() {
     log "ERROR: $*" >&2
     exit 1
 }
-gen_secret() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48; }
+gen_secret() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48; true; }
 # Succeeds once the URL answers any HTTP status (only connection refusal fails).
 wait_http() {
     local url="$1" tries="${2:-60}" i=0
@@ -169,20 +169,26 @@ fi
 # Register an account through the token-gated UIAA flow. Some servers want a
 # final m.login.dummy stage after the token stage, so follow up if asked.
 register_user() { # localpart password
-    local localpart="$1" password="$2" session resp
-    session="$(curl -s -X POST "$HS_URL/_matrix/client/v3/register" \
-        -H 'Content-Type: application/json' -d '{}' | jq -r '.session // empty')"
+    local localpart="$1" password="$2" session resp i=0
+    # Retry the initial probe: /versions can answer before /register is ready.
+    while [ $i -lt 10 ]; do
+        session="$(curl -s -X POST "$HS_URL/_matrix/client/v3/register" \
+            -H 'Content-Type: application/json' -d '{}' | jq -r '.session // empty' || true)"
+        [ -n "$session" ] && break
+        i=$((i + 1))
+        sleep 1
+    done
     [ -n "$session" ] || die "homeserver did not open a registration session"
     resp="$(jq -n --arg u "$localpart" --arg p "$password" --arg t "$REG_SECRET" --arg s "$session" \
         '{username: $u, password: $p, inhibit_login: true,
-          initial_device_display_name: "lily-sandbox",
+          initial_device_display_name: "lily",
           auth: {type: "m.login.registration_token", token: $t, session: $s}}' \
         | curl -s -X POST "$HS_URL/_matrix/client/v3/register" \
             -H 'Content-Type: application/json' -d @-)"
     if jq -e '.completed and (.user_id | not)' >/dev/null 2>&1 <<<"$resp"; then
         resp="$(jq -n --arg u "$localpart" --arg p "$password" --arg s "$session" \
             '{username: $u, password: $p, inhibit_login: true,
-              initial_device_display_name: "lily-sandbox",
+              initial_device_display_name: "lily",
               auth: {type: "m.login.dummy", session: $s}}' \
             | curl -s -X POST "$HS_URL/_matrix/client/v3/register" \
                 -H 'Content-Type: application/json' -d @-)"
@@ -254,14 +260,14 @@ fi
 # the lily CLI (project/task/send) works against the right data dir.
 (
     umask 077
-    cat >"$HOME/.lily-sandbox-env" <<EOF
+    cat >"$HOME/.lily-env" <<EOF
 export LILY_DATA_DIR="$LILY_DATA_DIR"
 export OPENCODE_URL="$OPENCODE_URL"
 export MATRIX_HOMESERVER="$MATRIX_HOMESERVER"
 EOF
 )
-if ! grep -qs 'lily-sandbox-env' "$HOME/.bashrc"; then
-    printf '\n[ -f "$HOME/.lily-sandbox-env" ] && . "$HOME/.lily-sandbox-env"\n' \
+if ! grep -qs 'lily-env' "$HOME/.bashrc"; then
+    printf '\n[ -f "$HOME/.lily-env" ] && . "$HOME/.lily-env"\n' \
         >>"$HOME/.bashrc"
 fi
 
@@ -293,7 +299,7 @@ delay=2
 while :; do
     started="$(date +%s)"
     log "starting lily"
-    lily run &
+    lily run >>"$LOG_DIR/lily.log" 2>&1 &
     rc=0
     wait $! || rc=$?
     if [ $(($(date +%s) - started)) -ge 60 ]; then

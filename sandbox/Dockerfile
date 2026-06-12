@@ -1,7 +1,7 @@
 # Template image for running the full lily stack inside a Docker Sandbox
 # (https://docs.docker.com/ai/sandboxes/). Build from the repository root:
 #
-#   docker build -f sandbox/Dockerfile -t lily-sandbox:latest .
+#   docker build -f sandbox/Dockerfile -t lily:latest .
 #
 # The image extends the official `opencode` sandbox template (which ships the
 # opencode agent and satisfies the sandbox base-image contract: `agent` user at
