@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/ArtemisMucaj/lily/compare/v0.1.0...v0.2.0) (2026-06-12)
+
+
+### Features
+
+* Add CLAUDE.md and improve CLI help text for multi-platform support ([#5](https://github.com/ArtemisMucaj/lily/issues/5)) ([ae457ed](https://github.com/ArtemisMucaj/lily/commit/ae457eda17737164e919a258e5ab1fa46fdb9414))
+
 ## 0.1.0 (2026-06-11)
 
 
