@@ -17,55 +17,72 @@ die() {
     log "ERROR: $*" >&2
     exit 1
 }
-
-ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
-
 usage() { printf 'usage: sandbox/up [--build] PROJECT_DIR[:ro] [PROJECT_DIR[:ro]...]\n'; }
 
-build=0
-projects=()
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --build) build=1 ;;
-        -h | --help)
-            usage
-            exit 0
-            ;;
-        --) # everything after -- is a project path, dashes and all
-            shift
-            projects+=("$@")
-            break
-            ;;
-        -*)
-            usage >&2
-            die "unknown option: $1"
-            ;;
-        *) projects+=("$1") ;;
-    esac
-    shift
-done
-if [ ${#projects[@]} -eq 0 ]; then
-    usage >&2
-    exit 1
-fi
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+BUILD=0
+PROJECTS=()
 
-command -v docker >/dev/null || die "docker not found"
-command -v sbx >/dev/null || die "sbx not found (Docker Sandboxes CLI)"
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --build) BUILD=1 ;;
+            -h | --help)
+                usage
+                exit 0
+                ;;
+            --) # everything after -- is a project path, dashes and all
+                shift
+                PROJECTS+=("$@")
+                break
+                ;;
+            -*)
+                usage >&2
+                die "unknown option: $1"
+                ;;
+            *) PROJECTS+=("$1") ;;
+        esac
+        shift
+    done
+    if [ ${#PROJECTS[@]} -eq 0 ]; then
+        usage >&2
+        exit 1
+    fi
+}
 
-for p in "${projects[@]}"; do
-    [ -d "${p%:ro}" ] || die "project directory not found: ${p%:ro}"
-done
+check_prereqs() {
+    command -v docker >/dev/null || die "docker not found"
+    command -v sbx >/dev/null || die "sbx not found (Docker Sandboxes CLI)"
+    local p
+    for p in "${PROJECTS[@]}"; do
+        [ -d "${p%:ro}" ] || die "project directory not found: ${p%:ro}"
+    done
+}
 
-if [ "$build" = 1 ]; then
+build_template() {
     log "building lily:latest from $ROOT"
     docker build -f "$ROOT/sandbox/Dockerfile" -t lily:latest "$ROOT"
+    local tmp
     tmp="$(mktemp -d)"
-    trap 'rm -rf "$tmp"' EXIT
+    trap "rm -rf '$tmp'" EXIT
     log "loading the image into Docker Sandboxes"
     docker image save lily:latest -o "$tmp/lily.tar"
     sbx template load "$tmp/lily.tar"
-fi
+}
 
-mkdir -p "$HOME/.lily"
-log "starting the lily sandbox"
-exec sbx run --kit "$ROOT/sandbox/kit" lily "${projects[@]}" "$HOME/.lily"
+run_sandbox() {
+    mkdir -p "$HOME/.lily"
+    log "starting the lily sandbox"
+    exec sbx run --kit "$ROOT/sandbox/kit" lily "${PROJECTS[@]}" "$HOME/.lily"
+}
+
+main() {
+    parse_args "$@"
+    check_prereqs
+    if [ "$BUILD" = 1 ]; then
+        build_template
+    fi
+    run_sandbox
+}
+
+main "$@"
