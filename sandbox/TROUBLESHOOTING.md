@@ -1,39 +1,43 @@
 # Troubleshooting the lily Docker Sandbox
 
-Setup and architecture are documented in [README.md](README.md). Service logs
-are shared with the host at `~/.lily/sandbox/logs/` (`tuwunel.log`,
-`opencode.log`, `ngrok.log`) — start there.
+Service logs are shared with the host at `~/.lily/sandbox/logs/` — start
+there. Repeated `restarting in ...` lines in the agent session mean a
+service is crash-looping; its log names the underlying error (a bad
+`config.env` value, missing opencode credentials, an invalid
+`NGROK_AUTHTOKEN`).
 
-## A service keeps restarting
+## When in doubt: reset and start from scratch
 
-The entrypoint supervises every service (Tuwunel, opencode, ngrok, and lily
-itself) and restarts crashes with exponential backoff — 2s doubling up to
-60s, reset after a healthy minute. Repeated `restarting in ...` lines in the
-agent session mean a service is crash-looping: check its log under
-`~/.lily/sandbox/logs/` for the underlying error (a bad `config.env` value,
-a missing provider API key for opencode, or an invalid `NGROK_AUTHTOKEN` are
-the usual suspects).
+Everything the stack needs is recreated on the next boot, so the cure for a
+wedged setup is a clean slate. Two things are worth keeping: your
+hand-written settings, and `~/.lily/worktrees/` — **check it for unmerged
+branches before deleting**. Everything else is cheap:
 
-## Tuwunel won't start / database errors on the shared mount
+- `lily.db` — room↔project links, thread↔session bindings, scheduled tasks;
+  recreate links with `!add-project`, threads just start fresh sessions
+- `matrix-session.json`, `matrix-store/` — the bot's Matrix login; it logs
+  back in by itself
+- `sandbox/credentials.env` + the homeserver database — accounts, rooms and
+  history; you get a new password (the boot banner says where) and re-create
+  the room
+
+```bash
+sbx rm <sandbox-name>                      # sandbox/lilyctl status shows it
+mv ~/.lily/sandbox/config.env /tmp/        # keep your settings
+rm -rf ~/.lily
+mkdir -p ~/.lily/sandbox && mv /tmp/config.env ~/.lily/sandbox/
+sandbox/lilyctl up ~/code/my-project
+```
+
+## Tuwunel database errors on the shared mount
 
 RocksDB can be picky about locking and mmap on workspace passthrough
-filesystems. Set `LILY_SANDBOX_MATRIX_DATA=local` in `config.env` and remove
-`~/.lily/sandbox/matrix` + `credentials.env`; the homeserver then lives on
-the sandbox disk (still persistent, just not host-visible).
+filesystems. Set `LILY_SANDBOX_MATRIX_DATA=local` in `config.env` (then do
+the reset above): the homeserver database moves to the sandbox disk —
+host-invisible, and gone if you `sbx rm` the sandbox, but the entrypoint
+re-registers the accounts from `credentials.env` on the next boot.
 
 ## ngrok can't connect
 
 Sandbox egress runs through a policy proxy; allow the ngrok domains (the kit
 declares them) or relax the sandbox's network policy in the `sbx` dashboard.
-
-## Changing `server_name`
-
-Matrix bakes the server name into every user id; it cannot change after
-first boot. To start over, delete `~/.lily/sandbox/matrix/` and
-`~/.lily/sandbox/credentials.env` (and `~/.lily/matrix-store/` +
-`matrix-session.json` so the bot re-logs-in).
-
-## Full reset
-
-`sbx rm <name>` and delete the paths above; project folders and the rest of
-`~/.lily` are untouched.
