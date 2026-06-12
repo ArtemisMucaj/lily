@@ -3,7 +3,8 @@
 # image, create or resume the sandbox, and poke at it while it runs.
 # See sandbox/README.md for the full setup.
 #
-#   sandbox/lilyctl up --build ~/code/my-project   # first time
+#   sandbox/lilyctl build                          # first time: bake the image
+#   sandbox/lilyctl up ~/code/my-project           # create the sandbox
 #   sandbox/lilyctl up                             # resume the existing sandbox
 #   sandbox/lilyctl logs opencode                  # follow a service log
 #   sandbox/lilyctl shell                          # shell into the microVM
@@ -19,10 +20,9 @@ usage() {
     cat <<'EOF'
 usage: sandbox/lilyctl <command> [args]
 
-  up [--build] [PROJECT_DIR[:ro]...]  create the sandbox (or resume it when no
-                                      projects are given); --build refreshes
-                                      the template image first
-  build                               build and load the template image only
+  build                               build and load the template image
+  up [PROJECT_DIR[:ro]...]            create the sandbox (or resume it when no
+                                      projects are given)
   down                                stop the sandbox (state persists)
   status|ps                           list sandboxes
   logs [SERVICE]                      follow a service log (lily, opencode,
@@ -65,11 +65,10 @@ build_template() {
 }
 
 cmd_up() {
-    local build=0 p
+    local p
     local projects=()
     while [ $# -gt 0 ]; do
         case "$1" in
-            --build) build=1 ;;
             --) # everything after -- is a project path, dashes and all
                 shift
                 projects+=("$@")
@@ -86,10 +85,6 @@ cmd_up() {
     for p in ${projects[@]+"${projects[@]}"}; do
         [ -d "${p%:ro}" ] || die "project directory not found: ${p%:ro}"
     done
-
-    if [ "$build" = 1 ]; then
-        build_template
-    fi
 
     if [ ${#projects[@]} -eq 0 ]; then
         local name

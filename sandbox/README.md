@@ -61,8 +61,9 @@ The short version — [`sandbox/lilyctl`](lilyctl) wraps the whole lifecycle
 (configure first, see step 2):
 
 ```bash
-sandbox/lilyctl up --build ~/code/my-project   # build, load, run
-sandbox/lilyctl up                             # later: resume the sandbox
+sandbox/lilyctl build                  # bake + load the template image
+sandbox/lilyctl up ~/code/my-project   # create and run the sandbox
+sandbox/lilyctl up                     # later: resume it
 ```
 
 The same thing step by step:
