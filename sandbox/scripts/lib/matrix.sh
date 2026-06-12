@@ -125,6 +125,10 @@ MATRIX_BOT_PASSWORD=$bot_password
 EOF
         )
     fi
+    # Re-tighten permissions in case they drifted (the file is host-editable
+    # on the shared mount, where chmod support can vary — warn, don't die).
+    chmod 600 "$CRED_FILE" 2>/dev/null \
+        || log "WARNING: could not tighten permissions on $CRED_FILE"
     # shellcheck disable=SC1090
     . "$CRED_FILE"
 

@@ -22,6 +22,6 @@ supervise() { # name logfile cmd...
         sleep "$delay" &
         child=$!
         wait "$child" || true
-        delay=$((delay >= 60 ? 60 : delay * 2))
+        delay=$((delay * 2 > 60 ? 60 : delay * 2))
     done
 }

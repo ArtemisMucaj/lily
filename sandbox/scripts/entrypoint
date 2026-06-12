@@ -51,4 +51,4 @@ print_banner
 # `wait` and the cleanup trap fires immediately instead of after lily exits.
 log "starting lily"
 supervise lily "$LOG_DIR/lily.log" lily run &
-wait $! || true
+wait $!

@@ -6,11 +6,11 @@
 write_shell_env() {
     (
         umask 077
-        cat >"$HOME/.lily-env" <<EOF
-export LILY_DATA_DIR="$LILY_DATA_DIR"
-export OPENCODE_URL="$OPENCODE_URL"
-export MATRIX_HOMESERVER="$MATRIX_HOMESERVER"
-EOF
+        {
+            printf 'export LILY_DATA_DIR=%q\n' "$LILY_DATA_DIR"
+            printf 'export OPENCODE_URL=%q\n' "$OPENCODE_URL"
+            printf 'export MATRIX_HOMESERVER=%q\n' "$MATRIX_HOMESERVER"
+        } >"$HOME/.lily-env"
     )
     if ! grep -qs 'lily-env' "$HOME/.bashrc"; then
         printf '\n[ -f "$HOME/.lily-env" ] && . "$HOME/.lily-env"\n' \
