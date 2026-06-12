@@ -64,10 +64,13 @@ build_template() {
     docker build -f "$ROOT/sandbox/Dockerfile" -t lily:latest "$ROOT"
     local tmp
     tmp="$(mktemp -d)"
+    # Clean up explicitly too: run_sandbox execs, which skips EXIT traps.
     trap "rm -rf '$tmp'" EXIT
     log "loading the image into Docker Sandboxes"
     docker image save lily:latest -o "$tmp/lily.tar"
     sbx template load "$tmp/lily.tar"
+    rm -rf "$tmp"
+    trap - EXIT
 }
 
 run_sandbox() {
