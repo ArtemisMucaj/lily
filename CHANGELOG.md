@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.0](https://github.com/ArtemisMucaj/lily/compare/v0.3.0...v0.4.0) (2026-06-12)
+
+
+### Features
+
+* **sandbox:** opencode auth gate + modular entrypoint ([#10](https://github.com/ArtemisMucaj/lily/issues/10)) ([9519709](https://github.com/ArtemisMucaj/lily/commit/95197093f4aef5e89e1e82c94b7e880ad93515b3))
+
+
+### Bug Fixes
+
+* add logs to lily, fix entrypoint ([c8ede96](https://github.com/ArtemisMucaj/lily/commit/c8ede96c01138db0ad52146ba1f2d51f5072ec5c))
+
 ## [0.3.0](https://github.com/ArtemisMucaj/lily/compare/v0.2.0...v0.3.0) (2026-06-12)
 
 
