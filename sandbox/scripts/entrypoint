@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# lily-sandbox-up — entrypoint for the lily Docker Sandbox kit.
+# entrypoint — agent entrypoint for the lily Docker Sandbox kit, run whenever
+# the sandbox's agent session starts (sbx run / resume).
 #
 # Boots the full lily experience inside one sandbox microVM:
 #   1. a locked-down Tuwunel Matrix homeserver (no federation, registration
@@ -8,6 +9,10 @@
 #   3. an optional ngrok tunnel for reaching Matrix from outside (only when
 #      NGROK_AUTHTOKEN is set)
 #   4. lily itself, allowlisted to the owner account only
+#
+# Every service — lily included — is supervised: if it crashes it is
+# restarted with exponential backoff (2s doubling up to 60s; the backoff
+# resets once a run survives for a minute).
 #
 # Host-side settings are read from ~/.lily/sandbox/config.env (the .lily
 # workspace is shared with the host, so edit that file on either side).
@@ -26,6 +31,31 @@ wait_http() {
         i=$((i + 1))
         [ "$i" -ge "$tries" ] && return 1
         sleep 1
+    done
+}
+
+# Keep a service alive. Runs in the background; the TERM/INT trap forwards
+# the signal to the current child so shutdown stays clean. The backoff sleep
+# is backgrounded too — bash defers traps while a foreground command runs,
+# and `wait` is the only spot where signals interrupt immediately.
+supervise() { # name logfile cmd...
+    local name="$1" logfile="$2" child=0 delay=2 started rc
+    shift 2
+    trap '[ "$child" != 0 ] && kill "$child" 2>/dev/null; exit 0' TERM INT
+    while :; do
+        started="$(date +%s)"
+        "$@" >>"$logfile" 2>&1 &
+        child=$!
+        rc=0
+        wait "$child" || rc=$?
+        if [ $(($(date +%s) - started)) -ge 60 ]; then
+            delay=2
+        fi
+        log "$name exited (status $rc); restarting in ${delay}s (log: $logfile)"
+        sleep "$delay" &
+        child=$!
+        wait "$child" || true
+        delay=$((delay >= 60 ? 60 : delay * 2))
     done
 }
 
@@ -99,7 +129,7 @@ REG_SECRET="$(cat "$REG_SECRET_FILE")"
 (
     umask 077
     cat >"$HS_CONFIG" <<EOF
-# Written by lily-sandbox-up on every boot — edits here do not persist.
+# Written by the lily sandbox entrypoint on every boot — edits do not persist.
 [global]
 server_name = "$SERVER_NAME"
 database_path = "$MATRIX_DIR/db"
@@ -123,13 +153,15 @@ cleanup() {
     jobs -pr | xargs -r kill 2>/dev/null || true
     wait 2>/dev/null || true
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 if wait_http "$HS_URL/_matrix/client/versions" 1; then
     log "Tuwunel already running"
 else
     log "starting Tuwunel"
-    "$TUWUNEL" -c "$HS_CONFIG" >>"$LOG_DIR/tuwunel.log" 2>&1 &
+    supervise tuwunel "$LOG_DIR/tuwunel.log" "$TUWUNEL" -c "$HS_CONFIG" &
     wait_http "$HS_URL/_matrix/client/versions" 90 \
         || die "Tuwunel did not come up; see $LOG_DIR/tuwunel.log"
 fi
@@ -191,7 +223,8 @@ if wait_http "$OPENCODE_URL" 1; then
     log "opencode already running"
 else
     log "starting opencode serve"
-    opencode serve --hostname 127.0.0.1 --port 4096 >>"$LOG_DIR/opencode.log" 2>&1 &
+    supervise opencode "$LOG_DIR/opencode.log" \
+        opencode serve --hostname 127.0.0.1 --port 4096 &
     wait_http "$OPENCODE_URL" 60 \
         || die "opencode serve did not come up; see $LOG_DIR/opencode.log"
 fi
@@ -204,7 +237,7 @@ if [ -n "${NGROK_AUTHTOKEN:-}" ]; then
         log "starting ngrok tunnel"
         ngrok_args=(http 8008 --log stdout)
         [ -n "${NGROK_DOMAIN:-}" ] && ngrok_args+=(--url "https://$NGROK_DOMAIN")
-        ngrok "${ngrok_args[@]}" >>"$LOG_DIR/ngrok.log" 2>&1 &
+        supervise ngrok "$LOG_DIR/ngrok.log" ngrok "${ngrok_args[@]}" &
     fi
     for _ in $(seq 1 30); do
         NGROK_URL="$(curl -s --max-time 2 http://127.0.0.1:4040/api/tunnels 2>/dev/null \
@@ -217,7 +250,8 @@ else
     log "NGROK_AUTHTOKEN not set — skipping remote tunnel (local access only)"
 fi
 
-# Environment for `sbx exec` sessions; lilyctl sources this.
+# Make `sbx exec -it <name> bash` shells pick up the stack's environment so
+# the lily CLI (project/task/send) works against the right data dir.
 (
     umask 077
     cat >"$HOME/.lily-sandbox-env" <<EOF
@@ -226,6 +260,10 @@ export OPENCODE_URL="$OPENCODE_URL"
 export MATRIX_HOMESERVER="$MATRIX_HOMESERVER"
 EOF
 )
+if ! grep -qs 'lily-sandbox-env' "$HOME/.bashrc"; then
+    printf '\n[ -f "$HOME/.lily-sandbox-env" ] && . "$HOME/.lily-sandbox-env"\n' \
+        >>"$HOME/.bashrc"
+fi
 
 cat <<EOF
 
@@ -248,5 +286,21 @@ cat <<EOF
 
 EOF
 
-log "starting lily"
-lily run
+# lily's output stays attached to the agent session; it runs as a waited-on
+# background child (not foreground) so TERM/INT interrupt the `wait` and the
+# cleanup trap fires immediately instead of after lily exits.
+delay=2
+while :; do
+    started="$(date +%s)"
+    log "starting lily"
+    lily run &
+    rc=0
+    wait $! || rc=$?
+    if [ $(($(date +%s) - started)) -ge 60 ]; then
+        delay=2
+    fi
+    log "lily exited (status $rc); restarting in ${delay}s"
+    sleep "$delay" &
+    wait $! || true
+    delay=$((delay >= 60 ? 60 : delay * 2))
+done

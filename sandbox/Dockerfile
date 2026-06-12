@@ -7,7 +7,7 @@
 # opencode agent and satisfies the sandbox base-image contract: `agent` user at
 # UID 1000 with passwordless sudo) and adds lily, the Tuwunel Matrix
 # homeserver, and the ngrok agent. The kit in sandbox/kit/ boots everything
-# via `lily-sandbox-up`.
+# via the entrypoint script.
 
 FROM rust:1 AS lily-builder
 WORKDIR /src
@@ -41,8 +41,7 @@ RUN ARCH="$(dpkg --print-architecture)" \
        | tar -xz -C /usr/local/bin ngrok
 
 COPY --from=lily-builder /src/target/release/lily /usr/local/bin/lily
-COPY sandbox/scripts/lily-sandbox-up /usr/local/bin/lily-sandbox-up
-COPY sandbox/scripts/lilyctl /usr/local/bin/lilyctl
-RUN chmod 0755 /usr/local/bin/lily /usr/local/bin/lily-sandbox-up /usr/local/bin/lilyctl
+COPY sandbox/scripts/entrypoint /usr/local/bin/entrypoint
+RUN chmod 0755 /usr/local/bin/lily /usr/local/bin/entrypoint
 
 USER agent

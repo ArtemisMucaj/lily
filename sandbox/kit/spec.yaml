@@ -18,7 +18,7 @@ agent:
   image: "lily-sandbox:latest"
   persistence: persistent
   entrypoint:
-    run: [lily-sandbox-up]
+    run: [entrypoint]
 
 environment:
   variables:
