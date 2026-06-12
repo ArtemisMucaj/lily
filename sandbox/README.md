@@ -57,6 +57,15 @@ Python, idles in the tens of megabytes.
 
 ## Setup
 
+The short version — [`sandbox/up`](up) builds the image, loads the template,
+and runs the stack in one go (configure first, see step 2):
+
+```bash
+sandbox/up ~/code/my-project            # add --skip-build to reuse the template
+```
+
+The same thing step by step:
+
 **1. Build the template image** (from the repository root):
 
 ```bash

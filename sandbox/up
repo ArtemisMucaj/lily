@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# up — build the lily template image, load it into Docker Sandboxes, and run
+# the stack: everything in sandbox/README.md's setup in one command.
+#
+#   sandbox/up ~/code/my-project [more-projects...]      # build + run
+#   sandbox/up --skip-build ~/code/my-project            # reuse loaded template
+#
+# Project folders are mounted at their host absolute paths (append :ro for
+# read-only); ~/.lily is always mounted so state and config are shared with
+# the host. Resume an existing sandbox instead with:
+#
+#   sbx run --kit sandbox/kit <sandbox-name>
+set -euo pipefail
+
+log() { printf '[lily] %s\n' "$*"; }
+die() {
+    log "ERROR: $*" >&2
+    exit 1
+}
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+
+skip_build=0
+if [ "${1:-}" = "--skip-build" ]; then
+    skip_build=1
+    shift
+fi
+[ $# -ge 1 ] || die "usage: sandbox/up [--skip-build] PROJECT_DIR[:ro] [PROJECT_DIR[:ro]...]"
+
+command -v docker >/dev/null || die "docker not found"
+command -v sbx >/dev/null || die "sbx not found (Docker Sandboxes CLI)"
+
+projects=()
+for p in "$@"; do
+    [ -d "${p%:ro}" ] || die "project directory not found: ${p%:ro}"
+    projects+=("$p")
+done
+
+if [ "$skip_build" = 0 ]; then
+    log "building lily:latest from $ROOT"
+    docker build -f "$ROOT/sandbox/Dockerfile" -t lily:latest "$ROOT"
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+    log "loading the image into Docker Sandboxes"
+    docker image save lily:latest -o "$tmp/lily.tar"
+    sbx template load "$tmp/lily.tar"
+fi
+
+mkdir -p "$HOME/.lily"
+log "starting the lily sandbox"
+exec sbx run --kit "$ROOT/sandbox/kit" lily "${projects[@]}" "$HOME/.lily"
