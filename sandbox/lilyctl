@@ -55,7 +55,6 @@ build_template() {
     docker build -f "$ROOT/sandbox/Dockerfile" -t lily:latest "$ROOT"
     local tmp
     tmp="$(mktemp -d)"
-    # Clean up explicitly too: cmd_up execs, which skips EXIT traps.
     trap "rm -rf '$tmp'" EXIT
     log "loading the image into Docker Sandboxes"
     docker image save lily:latest -o "$tmp/lily.tar"
