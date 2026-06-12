@@ -1,0 +1,47 @@
+# Agent kit that runs the full lily stack in a Docker Sandbox.
+# See sandbox/README.md for the end-to-end setup.
+#
+#   sbx run --kit ./sandbox/kit lily ~/code/my-project ~/.lily
+schemaVersion: "1"
+kind: agent
+name: lily
+displayName: Lily
+description: >
+  Chat-driven coding agent orchestrator: lily bridges a private Matrix
+  homeserver (and optionally Discord) to an opencode server, all inside one
+  sandbox. Boots Synapse (federation off, registration closed), opencode
+  serve, an optional ngrok tunnel, and lily itself.
+
+agent:
+  # Built from sandbox/Dockerfile; load it with `sbx template load` or push it
+  # to a registry and update this reference.
+  image: "lily-sandbox:latest"
+  persistence: persistent
+  entrypoint:
+    run: [lily-sandbox-up]
+
+environment:
+  variables:
+    LILY_SANDBOX: "1"
+  proxyManaged:
+    - ANTHROPIC_API_KEY
+
+credentials:
+  sources:
+    anthropic:
+      env:
+        - ANTHROPIC_API_KEY
+
+network:
+  serviceDomains:
+    api.anthropic.com: anthropic
+  serviceAuth:
+    anthropic:
+      headerName: x-api-key
+      valueFormat: "%s"
+  allowedDomains:
+    # ngrok agent control plane and edges (remote Matrix access).
+    - "connect.ngrok-agent.com:443"
+    - "*.ngrok.com:443"
+    - "*.ngrok-free.app:443"
+    - "*.ngrok.io:443"

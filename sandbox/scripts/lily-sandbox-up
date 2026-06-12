@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+# lily-sandbox-up — entrypoint for the lily Docker Sandbox kit.
+#
+# Boots the full lily experience inside one sandbox microVM:
+#   1. a locked-down Synapse Matrix homeserver (no federation, registration
+#      closed, data shared with the host under ~/.lily/sandbox/matrix)
+#   2. opencode serve on 127.0.0.1:4096
+#   3. an optional ngrok tunnel for reaching Matrix from outside (only when
+#      NGROK_AUTHTOKEN is set)
+#   4. lily itself, allowlisted to the owner account only
+#
+# Host-side settings are read from ~/.lily/sandbox/config.env (the .lily
+# workspace is shared with the host, so edit that file on either side).
+set -euo pipefail
+
+log() { printf '[lily-sandbox] %s\n' "$*"; }
+die() {
+    log "ERROR: $*" >&2
+    exit 1
+}
+gen_secret() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48; }
+# Succeeds once the URL answers any HTTP status (only connection refusal fails).
+wait_http() {
+    local url="$1" tries="${2:-60}" i=0
+    until curl -s -o /dev/null --max-time 2 "$url"; do
+        i=$((i + 1))
+        [ "$i" -ge "$tries" ] && return 1
+        sleep 1
+    done
+}
+
+SYNAPSE=/opt/synapse/bin
+
+# ---------------------------------------------------------------------------
+# Locate the data dir. Docker Sandboxes mount workspaces at their host
+# absolute paths, so when the host's ~/.lily is passed as a workspace it shows
+# up as a mount whose path ends in /.lily.
+# ---------------------------------------------------------------------------
+if [ -z "${LILY_DATA_DIR:-}" ]; then
+    mounted="$(awk '$2 ~ /\/\.lily$/ { print $2; exit }' /proc/mounts || true)"
+    LILY_DATA_DIR="${mounted:-$HOME/.lily}"
+fi
+export LILY_DATA_DIR
+SANDBOX_DIR="$LILY_DATA_DIR/sandbox"
+LOG_DIR="$SANDBOX_DIR/logs"
+mkdir -p "$SANDBOX_DIR" "$LOG_DIR"
+chmod 700 "$SANDBOX_DIR"
+log "data dir: $LILY_DATA_DIR"
+
+if [ -f "$SANDBOX_DIR/config.env" ]; then
+    log "loading $SANDBOX_DIR/config.env"
+    set -a
+    # shellcheck disable=SC1091
+    . "$SANDBOX_DIR/config.env"
+    set +a
+fi
+
+SERVER_NAME="${LILY_MATRIX_SERVER_NAME:-lily.localhost}"
+BOT_LOCALPART="${LILY_MATRIX_BOT_USER:-lily}"
+OWNER_LOCALPART="${LILY_OWNER_USER:-owner}"
+BOT_MXID="@$BOT_LOCALPART:$SERVER_NAME"
+OWNER_MXID="@$OWNER_LOCALPART:$SERVER_NAME"
+
+# Matrix data is shared with the host by default. `local` keeps the live
+# databases on the sandbox disk instead — the escape hatch if SQLite misbehaves
+# on the passthrough filesystem.
+case "${LILY_SANDBOX_MATRIX_DATA:-shared}" in
+    shared) MATRIX_DIR="$SANDBOX_DIR/matrix" ;;
+    local) MATRIX_DIR="$HOME/.lily-matrix" ;;
+    *) die "LILY_SANDBOX_MATRIX_DATA must be 'shared' or 'local'" ;;
+esac
+mkdir -p "$MATRIX_DIR"
+chmod 700 "$MATRIX_DIR"
+
+# ---------------------------------------------------------------------------
+# Synapse configuration. --generate-config runs once (it mints the signing key
+# and secrets); the hardening overlay is rewritten on every boot and wins over
+# the generated file, so the lockdown cannot drift.
+# ---------------------------------------------------------------------------
+HS_CONFIG="$MATRIX_DIR/homeserver.yaml"
+HS_HARDENING="$MATRIX_DIR/lily-hardening.yaml"
+REG_SECRET_FILE="$MATRIX_DIR/registration.secret"
+
+if [ ! -f "$HS_CONFIG" ]; then
+    log "generating Synapse config (server_name=$SERVER_NAME)"
+    "$SYNAPSE/python" -m synapse.app.homeserver \
+        --generate-config \
+        --config-path "$HS_CONFIG" \
+        --data-directory "$MATRIX_DIR" \
+        --server-name "$SERVER_NAME" \
+        --report-stats no >/dev/null
+fi
+
+if [ ! -f "$REG_SECRET_FILE" ]; then
+    (
+        umask 077
+        gen_secret >"$REG_SECRET_FILE"
+    )
+fi
+REG_SECRET="$(cat "$REG_SECRET_FILE")"
+
+# Private single-tenant homeserver: the federation API is not served at all
+# (no `federation` listener resource), outbound federation is disabled by the
+# empty whitelist, and registration is closed — accounts can only be created
+# with the local shared secret.
+{
+    cat <<EOF
+enable_registration: false
+enable_registration_without_verification: false
+registration_shared_secret: "$REG_SECRET"
+federation_domain_whitelist: []
+allow_public_rooms_over_federation: false
+allow_public_rooms_without_auth: false
+serve_server_wellknown: false
+report_stats: false
+trusted_key_servers: []
+suppress_key_server_warning: true
+listeners:
+  - port: 8008
+    type: http
+    tls: false
+    x_forwarded: true
+    bind_addresses: ['0.0.0.0']
+    resources:
+      - names: [client]
+        compress: false
+EOF
+    if [ -n "${NGROK_DOMAIN:-}" ]; then
+        printf 'public_baseurl: "https://%s/"\n' "$NGROK_DOMAIN"
+    fi
+} >"$HS_HARDENING"
+chmod 600 "$HS_HARDENING"
+
+# ---------------------------------------------------------------------------
+# Services. Reconnecting to an existing sandbox reruns this entrypoint, so
+# each service is skipped when it already answers.
+# ---------------------------------------------------------------------------
+cleanup() {
+    trap - EXIT INT TERM
+    log "shutting down"
+    jobs -pr | xargs -r kill 2>/dev/null || true
+    wait 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+if wait_http "http://127.0.0.1:8008/health" 1; then
+    log "Synapse already running"
+else
+    log "starting Synapse"
+    "$SYNAPSE/python" -m synapse.app.homeserver \
+        -c "$HS_CONFIG" -c "$HS_HARDENING" >>"$LOG_DIR/synapse.log" 2>&1 &
+    wait_http "http://127.0.0.1:8008/health" 90 \
+        || die "Synapse did not become healthy; see $LOG_DIR/synapse.log"
+fi
+
+CRED_FILE="$SANDBOX_DIR/credentials.env"
+if [ ! -f "$CRED_FILE" ]; then
+    log "first run: creating Matrix accounts $OWNER_MXID and $BOT_MXID"
+    BOT_PASSWORD="$(gen_secret)"
+    OWNER_PASSWORD="$(gen_secret)"
+    "$SYNAPSE/register_new_matrix_user" -u "$OWNER_LOCALPART" -p "$OWNER_PASSWORD" \
+        --admin -k "$REG_SECRET" http://127.0.0.1:8008
+    "$SYNAPSE/register_new_matrix_user" -u "$BOT_LOCALPART" -p "$BOT_PASSWORD" \
+        --no-admin -k "$REG_SECRET" http://127.0.0.1:8008
+    (
+        umask 077
+        cat >"$CRED_FILE" <<EOF
+MATRIX_OWNER_MXID=$OWNER_MXID
+MATRIX_OWNER_PASSWORD=$OWNER_PASSWORD
+MATRIX_BOT_MXID=$BOT_MXID
+MATRIX_BOT_PASSWORD=$BOT_PASSWORD
+EOF
+    )
+fi
+# shellcheck disable=SC1090
+. "$CRED_FILE"
+
+export MATRIX_HOMESERVER="http://127.0.0.1:8008"
+export MATRIX_USER="$MATRIX_BOT_MXID"
+export MATRIX_PASSWORD="$MATRIX_BOT_PASSWORD"
+export OPENCODE_URL="${OPENCODE_URL:-http://127.0.0.1:4096}"
+# Only the owner may drive the bot unless config.env widens this explicitly.
+export LILY_ALLOWED_USERS="${LILY_ALLOWED_USERS:-$MATRIX_OWNER_MXID}"
+
+if wait_http "$OPENCODE_URL" 1; then
+    log "opencode already running"
+else
+    log "starting opencode serve"
+    opencode serve --hostname 127.0.0.1 --port 4096 >>"$LOG_DIR/opencode.log" 2>&1 &
+    wait_http "$OPENCODE_URL" 60 \
+        || die "opencode serve did not come up; see $LOG_DIR/opencode.log"
+fi
+
+NGROK_URL=""
+if [ -n "${NGROK_AUTHTOKEN:-}" ]; then
+    if wait_http "http://127.0.0.1:4040/api/tunnels" 1; then
+        log "ngrok already running"
+    else
+        log "starting ngrok tunnel"
+        ngrok_args=(http 8008 --log stdout)
+        [ -n "${NGROK_DOMAIN:-}" ] && ngrok_args+=(--url "https://$NGROK_DOMAIN")
+        ngrok "${ngrok_args[@]}" >>"$LOG_DIR/ngrok.log" 2>&1 &
+    fi
+    for _ in $(seq 1 30); do
+        NGROK_URL="$(curl -s --max-time 2 http://127.0.0.1:4040/api/tunnels 2>/dev/null \
+            | jq -r '.tunnels[0].public_url // empty')"
+        [ -n "$NGROK_URL" ] && break
+        sleep 1
+    done
+    [ -n "$NGROK_URL" ] || log "WARNING: no ngrok tunnel URL yet; see $LOG_DIR/ngrok.log"
+else
+    log "NGROK_AUTHTOKEN not set — skipping remote tunnel (local access only)"
+fi
+
+# Environment for `sbx exec` sessions; lilyctl sources this.
+(
+    umask 077
+    cat >"$HOME/.lily-sandbox-env" <<EOF
+export LILY_DATA_DIR="$LILY_DATA_DIR"
+export OPENCODE_URL="$OPENCODE_URL"
+export MATRIX_HOMESERVER="$MATRIX_HOMESERVER"
+EOF
+)
+
+cat <<EOF
+
+==============================================================================
+ lily sandbox is up
+   Matrix server   $SERVER_NAME   (federation OFF, registration CLOSED)
+   Allowed driver  $LILY_ALLOWED_USERS
+   Your login      $MATRIX_OWNER_MXID
+   Your password   $SANDBOX_DIR/credentials.env  (readable from the host)
+   Bot account     $BOT_MXID
+   Remote URL      ${NGROK_URL:-— (set NGROK_AUTHTOKEN in config.env to enable)}
+
+ Connect a Matrix client:
+   local:  on the host run    sbx ports <sandbox-name> --publish 8008:8008
+           then use http://localhost:8008 as the homeserver URL
+   remote: use ${NGROK_URL:-the ngrok URL} as the homeserver URL
+   log in as $MATRIX_OWNER_MXID, create a room, invite $BOT_MXID
+   (it auto-joins), then link a mounted project: !add-project /abs/path
+==============================================================================
+
+EOF
+
+log "starting lily"
+lily run
